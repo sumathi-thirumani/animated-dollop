@@ -1,0 +1,120 @@
+import type { RouteRecordRaw } from 'vue-router';
+import type { FeatureFlagsResponse } from '@/api-access/generated/models';
+import { type NavigationLink, useNavigationStore } from '@/stores/NavigationStore';
+import { useAccessControl } from '@/composables/useAccessControl';
+import { Permissions } from '@/api-access/generated/models';
+
+const myTeamRoutes: RouteRecordRaw[] = [
+  {
+    path: '/myteam',
+    children: [
+      {
+        path: '',
+        name: 'MyTeam',
+        component: () => import('./views/Myteam.vue'),
+        meta: {
+          title: 'My team',
+        },
+      },
+      {
+        path: ':userId',
+        name: 'UserProfile',
+        component: () => import('./views/UserProfile.vue'),
+        redirect: (to) => ({
+          name: 'UserIdentification',
+          params: to.params,
+        }),
+        meta: {
+          title: 'User Profile',
+        },
+        props: true,
+        children: [
+          {
+            path: 'identification',
+            name: 'UserIdentification',
+            component: () => import('./components/Identification.vue'),
+            meta: {
+              title: 'User Identification',
+            },
+          },
+          {
+            path: 'assign-roles',
+            name: 'UserAssignRoles',
+            component: () => import('./views/AssignRoles.vue'),
+            meta: {
+              title: 'Assign Roles',
+            },
+          },
+          {
+            path: 'acting-positions',
+            name: 'UserActingPositions',
+            component: () => import('./views/ActingPositions.vue'),
+            meta: {
+              title: 'Acting Positions',
+            },
+          },
+          {
+            path: 'training',
+            name: 'UserTraining',
+            component: () => import('./views/UserTrainingView.vue'),
+            meta: {
+              title: 'Training',
+            },
+          },
+          {
+            path: 'away-locations',
+            name: 'UserAwayLocations',
+            component: () => import('./views/AwayLocations.vue'),
+            meta: {
+              title: 'Away Locations',
+            },
+          },
+          {
+            path: 'leave',
+            name: 'UserLeave',
+            component: () => import('./views/UserLeave.vue'),
+            meta: {
+              title: 'Leave',
+            },
+          },
+        ],
+      },
+    ],
+    meta: {
+      requiresAuth: true,
+    },
+  },
+  {
+    path: '/roles-permissions',
+    name: 'RolesPermissions',
+    component: () => import('./views/RolesPermissions.vue'),
+    meta: {
+      title: 'Roles & Permissions',
+      requiresAuth: true,
+    },
+  },
+];
+
+const navLink: NavigationLink = { name: 'My Team', path: '/myteam', class: 'router-link--border' };
+const rolesAndPermissionsNavLink: NavigationLink = {
+  name: 'Roles & Permissions',
+  path: '/roles-permissions',
+  class: 'router-link--border',
+};
+
+export function registerModule(routes: RouteRecordRaw[], featureFlags: FeatureFlagsResponse) {
+  if (!featureFlags.UserManagement?.enabled) {
+    return;
+  }
+
+  const navigationStore = useNavigationStore();
+  const accessControl = useAccessControl();
+
+  routes.push(...myTeamRoutes);
+
+  navigationStore.registerLink(navLink);
+
+  if (accessControl.hasPermission(Permissions.RolesView)) {
+    navigationStore.registerLink(rolesAndPermissionsNavLink);
+  }
+}

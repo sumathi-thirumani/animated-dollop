@@ -1,0 +1,96 @@
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
+using Unified.Authorization;
+using Unified.Calendar.Conflicts;
+using Unified.Calendar.FeatureFlags;
+using Unified.Calendar.Holidays;
+using Unified.Calendar.Mappings;
+using Unified.Calendar.Options;
+using Unified.Calendar.Seeders;
+using Unified.Calendar.Services;
+using Unified.Calendar.Validators;
+using Unified.Common.FeatureFlags;
+using Unified.Common.Options;
+using Unified.Common.Seeding;
+using Unified.Common.Time;
+using Unified.Db;
+
+namespace Unified.Calendar;
+
+public static class CalendarModule
+{
+    public static bool IsModuleEnabled(IConfiguration config)
+    {
+        var enabled = config.GetSection(CalendarFeatureFlags.Section).Get<CalendarFeatureFlags>()?.Enabled ?? false;
+        return enabled;
+    }
+
+    public static bool IsModuleEnabled(IServiceProvider serviceProvider)
+    {
+        var options = serviceProvider.GetRequiredService<IOptions<CalendarFeatureFlags>>();
+        return options.Value.Enabled;
+    }
+
+    public static IServiceCollection AddCalendarModule(this IServiceCollection services, IConfiguration config)
+    {
+        services
+            .AddOptions<CalendarFeatureFlags>()
+            .BindConfiguration(CalendarFeatureFlags.Section)
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+        services.AddSingleton<
+            IValidateOptions<CalendarFeatureFlags>,
+            RequiredBooleanOptionsValidator<CalendarFeatureFlags>
+        >();
+        services.AddSingleton<IFeatureFlags>(sp => sp.GetRequiredService<IOptions<CalendarFeatureFlags>>().Value);
+
+        if (!IsModuleEnabled(config))
+        {
+            return services;
+        }
+
+        services
+            .AddOptions<CalendarDateTimeOptions>()
+            .BindConfiguration(CalendarDateTimeOptions.SectionName)
+            .ValidateDataAnnotations()
+            .Validate(BeValidDefaultTimeZoneId, "CalendarDateTime:DefaultTimeZoneId must be a valid system time zone.")
+            .ValidateOnStart();
+
+        services.AddSingleton<IStatutoryHolidayCalculator, BcStatutoryHolidayCalculator>();
+        services.AddSingleton<StatutoryHolidayCalendarDataProvider>();
+        services.AddScoped<ICalendarQueryService, CalendarQueryService>();
+        services.TryAddSingleton<CalendarEventMapper>();
+        services.TryAddScoped(typeof(CalendarEventServiceProvider<,,,>));
+        if (!services.Any(d => d.ServiceType == typeof(ITimeZoneService)))
+        {
+            services.AddSingleton<ITimeZoneService, TimeZoneService>();
+        }
+        services.AddSeeder<UnifiedDbContext, EventTypeSeeder>();
+        services.AddSeeder<UnifiedDbContext, EventStatusTypeSeeder>();
+        services.AddSingleton(CalendarPermissionSeedData.Configuration);
+
+        services.AddScoped<ICalendarTimeZoneResolver, CalendarTimeZoneResolver>();
+        services.AddScoped<CalendarLifecycleService>();
+        services.AddScoped<ICalendarConflictService, CalendarConflictService>();
+        services.AddScoped<IRecurrenceExpander, IcalNetRecurrenceExpander>();
+        services.AddScoped<IRecurrenceRuleValidator, IcalNetRecurrenceRuleValidator>();
+        services.AddScoped<IEventSeriesMaterializationService, EventSeriesMaterializationService>();
+        services.AddScoped<CalendarDataRequestValidator>();
+        services.AddScoped<CalendarConflictAcknowledgementValidator>();
+        services.AddAuthorizationBuilder().AddPermissionPolicy(Permissions.CalendarConflictsOverride);
+        services.Configure<MvcOptions>(options => options.Filters.Add<CalendarConflictExceptionFilter>());
+
+        return services;
+    }
+
+    private static bool BeValidDefaultTimeZoneId(CalendarDateTimeOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.DefaultTimeZoneId))
+            return false;
+
+        return TimeZoneService.IsValidTimeZoneId(options.DefaultTimeZoneId);
+    }
+}

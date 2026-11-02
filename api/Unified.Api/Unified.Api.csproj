@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
+    <PackageReference Include="FluentValidation" Version="12.1.1" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.12">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Scalar.AspNetCore" Version="2.17.3" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\db\db.csproj" />
+    <ProjectReference Include="..\Unified.Audit\Unified.Audit.csproj" />
+    <ProjectReference Include="..\Unified.Common\Unified.Common.csproj" />
+    <ProjectReference Include="..\Unified.Calendar\Unified.Calendar.csproj" />
+    <ProjectReference Include="..\Unified.Leave\Unified.Leave.csproj" />
+    <ProjectReference Include="..\Unified.UserManagement\Unified.UserManagement.csproj" />
+    <ProjectReference Include="..\Unified.Core\Unified.Core.csproj" />
+    <ProjectReference Include="..\Unified.Hangfire\Unified.Hangfire.csproj" />
+    <ProjectReference Include="..\Unified.Infrastructure\Unified.Infrastructure.csproj" />
+    <ProjectReference Include="..\Unified.Scheduling\Unified.Scheduling.csproj" />
+    <ProjectReference Include="..\Unified.Stats\Unified.Stats.csproj" />
+    <ProjectReference Include="..\Unified.Training\Unified.Training.csproj" />
+    <ProjectReference Include="..\Unified.Authorization\Unified.Authorization.csproj" />
+    <ProjectReference Include="..\Unified.JCInterface\Unified.JCInterface.csproj" />
+    <ProjectReference Include="..\Unified.Reporting\Unified.Reporting.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,771 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Unified.Calendar.Conflicts;
+using Unified.Calendar.Models;
+using Unified.Common.Calendar.Conflicts;
+using Unified.Common.Time;
+using Unified.Db;
+using Unified.Db.Models.Calendar;
+using Unified.Db.Models.Scheduling;
+using Unified.Scheduling.Mappings;
+using Unified.Scheduling.Models;
+
+namespace Unified.Scheduling.Services;
+
+public sealed class ShiftAssignmentService(
+    ILogger<ShiftAssignmentService> logger,
+    UnifiedDbContext db,
+    ITimeZoneService timeZoneService,
+    ICalendarConflictService calendarConflictService
+) : IShiftAssignmentService
+{
+    public async Task<ShiftAssignmentEntryResponse> LinkShiftEntryAsync(
+        ShiftAssignmentEntryRequest request,
+        CancellationToken cancellationToken = default,
+        Guid? conflictOverrideActorId = null
+    )
+    {
+        return await CreateOrUpdateShiftEntryLinkAsync(
+            request,
+            updateExisting: false,
+            expectedLinkId: null,
+            cancellationToken,
+            conflictOverrideActorId
+        );
+    }
+
+    public async Task<ShiftAssignmentEntryResponse?> UpdateShiftEntryLinkAsync(
+        int id,
+        ShiftAssignmentEntryUpdateRequest request,
+        CancellationToken cancellationToken = default,
+        Guid? conflictOverrideActorId = null
+    )
+    {
+        var linkIdentity = await db
+            .ShiftAssignmentEntries.AsNoTracking()
+            .Where(link => link.Id == id)
+            .Select(link => new { link.ShiftEntryId, link.AssignmentEntryId })
+            .SingleOrDefaultAsync(cancellationToken);
+        if (linkIdentity is null)
+            return null;
+
+        return await CreateOrUpdateShiftEntryLinkAsync(
+            new ShiftAssignmentEntryRequest
+            {
+                ShiftEntryId = linkIdentity.ShiftEntryId,
+                AssignmentEntryId = linkIdentity.AssignmentEntryId,
+                UserIds = request.UserIds,
+                ConflictOverrides = request.ConflictOverrides,
+            },
+            updateExisting: true,
+            expectedLinkId: id,
+            cancellationToken,
+            conflictOverrideActorId
+        );
+    }
+
+    public async Task<bool> DeleteShiftEntryLinkAsync(int id, CancellationToken cancellationToken = default)
+    {
+        await using var transaction = db.Database.CurrentTransaction is null
+            ? await db.Database.BeginTransactionAsync(cancellationToken)
+            : null;
+        var link = await db
+            .ShiftAssignmentEntries.Include(entryLink => entryLink.Users)
+            .SingleOrDefaultAsync(entryLink => entryLink.Id == id, cancellationToken);
+        if (link is null)
+            return false;
+
+        if (link.ShiftAssignmentSeriesLinkId.HasValue)
+            SuppressSeriesBackedLinks([link]);
+        else
+            RemoveLinks([link]);
+
+        await db.SaveChangesAsync(cancellationToken);
+        await InvalidateAssignmentEntryOverridesAsync([link.AssignmentEntryId], cancellationToken);
+        if (transaction is not null)
+            await transaction.CommitAsync(cancellationToken);
+        logger.LogInformation("Unlinked shift-assignment entry link {ShiftAssignmentEntryLinkId}.", id);
+        return true;
+    }
+
+    public async Task ReplaceShiftEntryLinksAsync(
+        int shiftEntryId,
+        IReadOnlyCollection<AssignmentEntryLinkRequest>? links,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (links is null)
+            return;
+
+        EnsureAmbientTransaction();
+        var existingLinks = await db
+            .ShiftAssignmentEntries.Include(link => link.Users)
+            .Where(link => link.ShiftEntryId == shiftEntryId)
+            .ToListAsync(cancellationToken);
+        await ReplaceEntryLinksAsync(
+            existingLinks,
+            links.Select(link => new EntryLinkReplacement(shiftEntryId, link.AssignmentEntryId, link.AssignedUserIds)),
+            cancellationToken
+        );
+        await InvalidateAssignmentEntryOverridesAsync(
+            existingLinks.Select(link => link.AssignmentEntryId).Concat(links.Select(link => link.AssignmentEntryId)),
+            cancellationToken
+        );
+    }
+
+    public async Task ReplaceAssignmentEntryLinksAsync(
+        int assignmentEntryId,
+        IReadOnlyCollection<ShiftEntryLinkRequest>? links,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (links is null)
+            return;
+
+        EnsureAmbientTransaction();
+        var existingLinks = await db
+            .ShiftAssignmentEntries.Include(link => link.Users)
+            .Where(link => link.AssignmentEntryId == assignmentEntryId)
+            .ToListAsync(cancellationToken);
+        await ReplaceEntryLinksAsync(
+            existingLinks,
+            links.Select(link => new EntryLinkReplacement(link.ShiftEntryId, assignmentEntryId, link.AssignedUserIds)),
+            cancellationToken
+        );
+        await InvalidateAssignmentEntryOverridesAsync([assignmentEntryId], cancellationToken);
+    }
+
+    public async Task<ShiftAssignmentSeriesLinkResponse> LinkShiftSeriesAsync(
+        ShiftAssignmentSeriesRequest request,
+        CancellationToken cancellationToken = default,
+        Guid? conflictOverrideActorId = null
+    )
+    {
+        return await CreateOrUpdateShiftSeriesLinkAsync(
+            request,
+            updateExisting: false,
+            expectedLinkId: null,
+            cancellationToken,
+            conflictOverrideActorId
+        );
+    }
+
+    public async Task<ShiftAssignmentSeriesLinkResponse?> UpdateShiftSeriesLinkAsync(
+        int id,
+        ShiftAssignmentSeriesUpdateRequest request,
+        CancellationToken cancellationToken = default,
+        Guid? conflictOverrideActorId = null
+    )
+    {
+        var linkIdentity = await db
+            .ShiftAssignmentSeriesLinks.AsNoTracking()
+            .Where(link => link.Id == id)
+            .Select(link => new { link.ShiftSeriesId, link.AssignmentSeriesId })
+            .SingleOrDefaultAsync(cancellationToken);
+        if (linkIdentity is null)
+            return null;
+
+        return await CreateOrUpdateShiftSeriesLinkAsync(
+            new ShiftAssignmentSeriesRequest
+            {
+                ShiftSeriesId = linkIdentity.ShiftSeriesId,
+                AssignmentSeriesId = linkIdentity.AssignmentSeriesId,
+                AssignedUserIds = request.AssignedUserIds,
+                ConflictOverrides = request.ConflictOverrides,
+            },
+            updateExisting: true,
+            expectedLinkId: id,
+            cancellationToken,
+            conflictOverrideActorId
+        );
+    }
+
+    public async Task<bool> DeleteShiftSeriesLinkAsync(int id, CancellationToken cancellationToken = default)
+    {
+        await using var transaction = db.Database.CurrentTransaction is null
+            ? await db.Database.BeginTransactionAsync(cancellationToken)
+            : null;
+        var link = await db
+            .ShiftAssignmentSeriesLinks.Include(seriesLink => seriesLink.Users)
+            .Include(seriesLink => seriesLink.EntryLinks)
+                .ThenInclude(entryLink => entryLink.Users)
+            .SingleOrDefaultAsync(seriesLink => seriesLink.Id == id, cancellationToken);
+        if (link is null)
+            return false;
+
+        RemoveSeriesLinks([link]);
+        await db.SaveChangesAsync(cancellationToken);
+        await InvalidateAssignmentSeriesOverridesAsync([link.AssignmentSeriesId], cancellationToken);
+        if (transaction is not null)
+            await transaction.CommitAsync(cancellationToken);
+        logger.LogInformation("Removed shift-assignment series link {ShiftAssignmentSeriesLinkId}.", id);
+        return true;
+    }
+
+    public async Task ReplaceShiftSeriesLinksAsync(
+        int shiftSeriesId,
+        IReadOnlyCollection<AssignmentSeriesLinkRequest> links,
+        CancellationToken cancellationToken = default
+    )
+    {
+        EnsureAmbientTransaction();
+        var existingLinks = await LoadSeriesLinksAsync(link => link.ShiftSeriesId == shiftSeriesId, cancellationToken);
+        await ReplaceSeriesLinksAsync(
+            existingLinks,
+            links.Select(link => new SeriesLinkReplacement(
+                shiftSeriesId,
+                link.AssignmentSeriesId,
+                link.AssignedUserIds
+            )),
+            cancellationToken
+        );
+        await InvalidateAssignmentSeriesOverridesAsync(
+            existingLinks.Select(link => link.AssignmentSeriesId).Concat(links.Select(link => link.AssignmentSeriesId)),
+            cancellationToken
+        );
+    }
+
+    public async Task ReplaceAssignmentSeriesLinksAsync(
+        int assignmentSeriesId,
+        IReadOnlyCollection<ShiftSeriesLinkRequest> links,
+        CancellationToken cancellationToken = default
+    )
+    {
+        EnsureAmbientTransaction();
+        var existingLinks = await LoadSeriesLinksAsync(
+            link => link.AssignmentSeriesId == assignmentSeriesId,
+            cancellationToken
+        );
+        await ReplaceSeriesLinksAsync(
+            existingLinks,
+            links.Select(link => new SeriesLinkReplacement(
+                link.ShiftSeriesId,
+                assignmentSeriesId,
+                link.AssignedUserIds
+            )),
+            cancellationToken
+        );
+        await InvalidateAssignmentSeriesOverridesAsync([assignmentSeriesId], cancellationToken);
+    }
+
+    private async Task<ShiftAssignmentSeriesLinkResponse> CreateOrUpdateShiftSeriesLinkAsync(
+        ShiftAssignmentSeriesRequest request,
+        bool updateExisting,
+        int? expectedLinkId,
+        CancellationToken cancellationToken,
+        Guid? conflictOverrideActorId = null,
+        bool validateConflicts = true
+    )
+    {
+        await using var transaction = db.Database.CurrentTransaction is null
+            ? await db.Database.BeginTransactionAsync(cancellationToken)
+            : null;
+        var selectedUserIds = ShiftAssignmentGuards.NormalizeRequiredUserIds(request.AssignedUserIds);
+        var shiftSeriesExists = await db.ShiftSeries.AnyAsync(
+            series => series.Id == request.ShiftSeriesId,
+            cancellationToken
+        );
+        var assignmentSeriesExists = await db.AssignmentSeries.AnyAsync(
+            series => series.Id == request.AssignmentSeriesId,
+            cancellationToken
+        );
+
+        if (!shiftSeriesExists)
+            throw new KeyNotFoundException($"Shift series {request.ShiftSeriesId} not found.");
+        if (!assignmentSeriesExists)
+            throw new KeyNotFoundException($"Assignment series {request.AssignmentSeriesId} not found.");
+
+        var shiftEntries = await db
+            .ShiftEntries.Include(entry => entry.Event)
+            .Include(entry => entry.Users)
+            .Where(entry => entry.ShiftSeriesId == request.ShiftSeriesId)
+            .Where(entry => entry.Event != null && entry.Event.StatusTypeCode != CalendarEventStatusTypeCodes.Cancelled)
+            .ToListAsync(cancellationToken);
+        var assignmentEntries = await db
+            .AssignmentEntries.Include(entry => entry.Event)
+            .Where(entry => entry.AssignmentSeriesId == request.AssignmentSeriesId)
+            .Where(entry => entry.Event != null && entry.Event.StatusTypeCode != CalendarEventStatusTypeCodes.Cancelled)
+            .ToListAsync(cancellationToken);
+
+        var intersections = (
+            from shiftEntry in shiftEntries
+            from assignmentEntry in assignmentEntries
+            where
+                ShiftAssignmentGuards.AssignmentStartsOnShiftDate(
+                    shiftEntry.Event!.StartAtUtc,
+                    shiftEntry.Event.EndAtUtc,
+                    assignmentEntry.Event!.StartAtUtc,
+                    shiftEntry.Event.TimeZoneId,
+                    timeZoneService
+                )
+            select (shiftEntry, assignmentEntry)
+        ).ToList();
+
+        if (intersections.Count == 0)
+            throw new InvalidOperationException(
+                $"Shift series {request.ShiftSeriesId} did not share a valid start date with any assignment entries in assignment series {request.AssignmentSeriesId}."
+            );
+
+        foreach (var shiftEntry in intersections.Select(pair => pair.shiftEntry).DistinctBy(entry => entry.Id))
+            ShiftAssignmentGuards.EnsureUsersBelongToShiftEntry(
+                shiftEntry,
+                selectedUserIds,
+                "Selected users must belong to every matching shift entry."
+            );
+
+        var shiftEntryIds = intersections.Select(pair => pair.shiftEntry.Id).Distinct().ToList();
+        var assignmentEntryIds = intersections.Select(pair => pair.assignmentEntry.Id).Distinct().ToList();
+        var existingLinks = await db
+            .ShiftAssignmentEntries.Include(link => link.Users)
+            .Include(link => link.ShiftAssignmentSeriesLink)
+                .ThenInclude(link => link!.Users)
+            .Where(link =>
+                shiftEntryIds.Contains(link.ShiftEntryId) && assignmentEntryIds.Contains(link.AssignmentEntryId)
+            )
+            .ToListAsync(cancellationToken);
+
+        var seriesLink = await db
+            .ShiftAssignmentSeriesLinks.Include(link => link.Users)
+            .Include(link => link.EntryLinks)
+                .ThenInclude(link => link.Users)
+            .SingleOrDefaultAsync(
+                link =>
+                    link.ShiftSeriesId == request.ShiftSeriesId
+                    && link.AssignmentSeriesId == request.AssignmentSeriesId,
+                cancellationToken
+            );
+
+        if (seriesLink is null)
+        {
+            if (updateExisting)
+                throw new KeyNotFoundException($"Shift-assignment series link {expectedLinkId} not found.");
+
+            var conflictingLink = existingLinks.FirstOrDefault(link => link.ShiftAssignmentSeriesLinkId is not null);
+            if (conflictingLink is not null)
+                throw new InvalidOperationException(
+                    $"Cannot link shift series {request.ShiftSeriesId} to assignment series {request.AssignmentSeriesId} because shift entry {conflictingLink.ShiftEntryId} and assignment entry {conflictingLink.AssignmentEntryId} are already linked by another series link."
+                );
+
+            var manualLink = existingLinks.FirstOrDefault(link => link.ShiftAssignmentSeriesLinkId is null);
+            if (manualLink is not null)
+                throw new InvalidOperationException(
+                    $"Cannot link shift series {request.ShiftSeriesId} to assignment series {request.AssignmentSeriesId} because shift entry {manualLink.ShiftEntryId} is already manually linked to assignment entry {manualLink.AssignmentEntryId}."
+                );
+
+            seriesLink = new ShiftAssignmentSeriesLink
+            {
+                ShiftSeriesId = request.ShiftSeriesId,
+                AssignmentSeriesId = request.AssignmentSeriesId,
+            };
+            db.ShiftAssignmentSeriesLinks.Add(seriesLink);
+        }
+        else
+        {
+            if (!updateExisting)
+                throw new InvalidOperationException("Shift series is already linked to this assignment series.");
+            if (expectedLinkId.HasValue && seriesLink.Id != expectedLinkId.Value)
+                throw new KeyNotFoundException($"Shift-assignment series link {expectedLinkId} not found.");
+
+            var conflictingLink = existingLinks.FirstOrDefault(link =>
+                link.ShiftAssignmentSeriesLinkId is not null && link.ShiftAssignmentSeriesLinkId != seriesLink.Id
+            );
+            if (conflictingLink is not null)
+                throw new InvalidOperationException(
+                    $"Cannot link shift series {request.ShiftSeriesId} to assignment series {request.AssignmentSeriesId} because shift entry {conflictingLink.ShiftEntryId} and assignment entry {conflictingLink.AssignmentEntryId} are already linked by another series link."
+                );
+
+            var manualLink = existingLinks.FirstOrDefault(link => link.ShiftAssignmentSeriesLinkId is null);
+            if (manualLink is not null)
+                throw new InvalidOperationException(
+                    $"Cannot link shift series {request.ShiftSeriesId} to assignment series {request.AssignmentSeriesId} because shift entry {manualLink.ShiftEntryId} is already manually linked to assignment entry {manualLink.AssignmentEntryId}."
+                );
+        }
+
+        db.ShiftAssignmentSeriesLinkUsers.RemoveRange(seriesLink.Users);
+        ShiftAssignmentUserSync.ReplaceSeriesUsers(seriesLink, selectedUserIds);
+
+        var intersectionKeys = intersections.Select(pair => (pair.shiftEntry.Id, pair.assignmentEntry.Id)).ToHashSet();
+        var existingLinksByPair = existingLinks.ToDictionary(
+            link => (link.ShiftEntryId, link.AssignmentEntryId),
+            link => link
+        );
+        var syncedLinks = new List<ShiftAssignmentEntry>();
+        foreach (var (shiftEntry, assignmentEntry) in intersections)
+        {
+            if (existingLinksByPair.TryGetValue((shiftEntry.Id, assignmentEntry.Id), out var existingLink))
+            {
+                if (existingLink.ShiftAssignmentSeriesLinkId == seriesLink.Id)
+                {
+                    if (!existingLink.IsException)
+                    {
+                        db.ShiftAssignmentEntryUsers.RemoveRange(existingLink.Users);
+                        ShiftAssignmentUserSync.ReplaceEntryUsers(existingLink, selectedUserIds);
+                    }
+                }
+                syncedLinks.Add(existingLink);
+                continue;
+            }
+
+            var link = ShiftAssignmentUserSync.CreateEntryLink(
+                shiftEntry.Id,
+                assignmentEntry.Id,
+                selectedUserIds,
+                seriesLink,
+                isException: false
+            );
+            db.ShiftAssignmentEntries.Add(link);
+            syncedLinks.Add(link);
+        }
+
+        var obsoleteGeneratedLinks = seriesLink
+            .EntryLinks.Where(link => !intersectionKeys.Contains((link.ShiftEntryId, link.AssignmentEntryId)))
+            .Where(link => !link.IsException)
+            .ToList();
+        RemoveLinks(obsoleteGeneratedLinks);
+        var responseLinks = seriesLink
+            .EntryLinks.Where(link => !obsoleteGeneratedLinks.Contains(link))
+            .Concat(syncedLinks)
+            .DistinctBy(link => (link.ShiftEntryId, link.AssignmentEntryId))
+            .ToList();
+
+        await db.SaveChangesAsync(cancellationToken);
+        if (validateConflicts)
+        {
+            var conflictCandidates =
+                await SchedulingConflictParticipantProvider.GetParticipantsForAssignmentEntriesAsync(
+                    db,
+                    assignmentEntryIds,
+                    cancellationToken
+                );
+            await calendarConflictService.ValidateAndApplyConflictAcknowledgementsAsync(
+                conflictCandidates,
+                request.ConflictOverrides,
+                conflictOverrideActorId,
+                cancellationToken
+            );
+            await InvalidateAssignmentEntryOverridesAsync(assignmentEntryIds, cancellationToken);
+        }
+        if (transaction is not null)
+            await transaction.CommitAsync(cancellationToken);
+
+        logger.LogInformation(
+            "Linked shift series {ShiftSeriesId} to assignment series {AssignmentSeriesId}; created {LinkCount} links.",
+            request.ShiftSeriesId,
+            request.AssignmentSeriesId,
+            syncedLinks.Count
+        );
+
+        return ShiftAssignmentResponseMapper.ToSeriesLinkResponse(seriesLink, responseLinks, assignmentEntries);
+    }
+
+    private async Task<ShiftAssignmentEntryResponse> CreateOrUpdateShiftEntryLinkAsync(
+        ShiftAssignmentEntryRequest request,
+        bool updateExisting,
+        int? expectedLinkId,
+        CancellationToken cancellationToken,
+        Guid? conflictOverrideActorId
+    )
+    {
+        await using var transaction = db.Database.CurrentTransaction is null
+            ? await db.Database.BeginTransactionAsync(cancellationToken)
+            : null;
+        var response = await UpsertSingleShiftAssignmentLinkAsync(
+            request.ShiftEntryId,
+            request.AssignmentEntryId,
+            request.UserIds,
+            cancellationToken,
+            updateExisting,
+            expectedLinkId,
+            request.ConflictOverrides,
+            conflictOverrideActorId
+        );
+        if (transaction is not null)
+            await transaction.CommitAsync(cancellationToken);
+        return response;
+    }
+
+    private async Task ReplaceEntryLinksAsync(
+        IReadOnlyCollection<ShiftAssignmentEntry> existingLinks,
+        IEnumerable<EntryLinkReplacement> requestedLinks,
+        CancellationToken cancellationToken
+    )
+    {
+        var replacements = requestedLinks.ToList();
+        EnsureDistinctEntryLinks(replacements);
+        var requestedIds = replacements.Select(link => (link.ShiftEntryId, link.AssignmentEntryId)).ToHashSet();
+        var removedLinks = existingLinks
+            .Where(link => !requestedIds.Contains((link.ShiftEntryId, link.AssignmentEntryId)))
+            .ToList();
+        SuppressSeriesBackedLinks(removedLinks.Where(link => link.ShiftAssignmentSeriesLinkId.HasValue).ToList());
+        RemoveLinks(removedLinks.Where(link => !link.ShiftAssignmentSeriesLinkId.HasValue).ToList());
+        await db.SaveChangesAsync(cancellationToken);
+
+        var existingById = existingLinks
+            .Except(removedLinks)
+            .ToDictionary(link => (link.ShiftEntryId, link.AssignmentEntryId));
+        foreach (var requestedLink in replacements)
+        {
+            existingById.TryGetValue(
+                (requestedLink.ShiftEntryId, requestedLink.AssignmentEntryId),
+                out var existingLink
+            );
+            await UpsertSingleShiftAssignmentLinkAsync(
+                requestedLink.ShiftEntryId,
+                requestedLink.AssignmentEntryId,
+                requestedLink.AssignedUserIds,
+                cancellationToken,
+                updateExisting: existingLink is not null,
+                expectedLinkId: existingLink?.Id,
+                validateConflicts: false
+            );
+        }
+    }
+
+    private async Task ReplaceSeriesLinksAsync(
+        IReadOnlyCollection<ShiftAssignmentSeriesLink> existingLinks,
+        IEnumerable<SeriesLinkReplacement> requestedLinks,
+        CancellationToken cancellationToken
+    )
+    {
+        var replacements = requestedLinks.ToList();
+        EnsureDistinctSeriesLinks(replacements);
+        var requestedIds = replacements.Select(link => (link.ShiftSeriesId, link.AssignmentSeriesId)).ToHashSet();
+        var removedLinks = existingLinks
+            .Where(link => !requestedIds.Contains((link.ShiftSeriesId, link.AssignmentSeriesId)))
+            .ToList();
+        RemoveSeriesLinks(removedLinks);
+        await db.SaveChangesAsync(cancellationToken);
+
+        var existingById = existingLinks
+            .Except(removedLinks)
+            .ToDictionary(link => (link.ShiftSeriesId, link.AssignmentSeriesId));
+        foreach (var requestedLink in replacements)
+        {
+            existingById.TryGetValue(
+                (requestedLink.ShiftSeriesId, requestedLink.AssignmentSeriesId),
+                out var existingLink
+            );
+            await CreateOrUpdateShiftSeriesLinkAsync(
+                new ShiftAssignmentSeriesRequest
+                {
+                    ShiftSeriesId = requestedLink.ShiftSeriesId,
+                    AssignmentSeriesId = requestedLink.AssignmentSeriesId,
+                    AssignedUserIds = requestedLink.AssignedUserIds,
+                },
+                updateExisting: existingLink is not null,
+                expectedLinkId: existingLink?.Id,
+                cancellationToken,
+                validateConflicts: false
+            );
+        }
+    }
+
+    private async Task<List<ShiftAssignmentSeriesLink>> LoadSeriesLinksAsync(
+        System.Linq.Expressions.Expression<Func<ShiftAssignmentSeriesLink, bool>> predicate,
+        CancellationToken cancellationToken
+    ) =>
+        await db
+            .ShiftAssignmentSeriesLinks.Include(link => link.Users)
+            .Include(link => link.EntryLinks)
+                .ThenInclude(link => link.Users)
+            .Where(predicate)
+            .ToListAsync(cancellationToken);
+
+    private void EnsureAmbientTransaction()
+    {
+        if (db.Database.CurrentTransaction is null)
+            throw new InvalidOperationException("Relationship replacement requires an active transaction.");
+    }
+
+    private static void EnsureDistinctEntryLinks(IReadOnlyCollection<EntryLinkReplacement> links) =>
+        EnsureDistinctLinks(links.Select(link => (link.ShiftEntryId, link.AssignmentEntryId)));
+
+    private static void EnsureDistinctSeriesLinks(IReadOnlyCollection<SeriesLinkReplacement> links) =>
+        EnsureDistinctLinks(links.Select(link => (link.ShiftSeriesId, link.AssignmentSeriesId)));
+
+    private static void EnsureDistinctLinks(IEnumerable<(int ShiftId, int AssignmentId)> links)
+    {
+        var ids = links.ToList();
+        if (ids.Any(link => link.ShiftId <= 0 || link.AssignmentId <= 0) || ids.Distinct().Count() != ids.Count)
+            throw new InvalidOperationException("Relationship IDs must be positive and unique.");
+    }
+
+    private sealed record EntryLinkReplacement(
+        int ShiftEntryId,
+        int AssignmentEntryId,
+        IReadOnlyCollection<Guid> AssignedUserIds
+    );
+
+    private sealed record SeriesLinkReplacement(
+        int ShiftSeriesId,
+        int AssignmentSeriesId,
+        IReadOnlyCollection<Guid> AssignedUserIds
+    );
+
+    private async Task<ShiftAssignmentEntryResponse> UpsertSingleShiftAssignmentLinkAsync(
+        int shiftEntryId,
+        int assignmentEntryId,
+        IReadOnlyCollection<Guid> assignedUserIds,
+        CancellationToken cancellationToken,
+        bool updateExisting = true,
+        int? expectedLinkId = null,
+        IReadOnlyCollection<CalendarConflictAcknowledgement>? conflictOverrides = null,
+        Guid? conflictOverrideActorId = null,
+        bool validateConflicts = true
+    )
+    {
+        var selectedUserIds = ShiftAssignmentGuards.NormalizeRequiredUserIds(assignedUserIds);
+        var shiftEntry = await LoadShiftEntryAsync(shiftEntryId, cancellationToken);
+        var assignmentEntry = await LoadAssignmentEntryAsync(assignmentEntryId, cancellationToken);
+
+        ShiftAssignmentGuards.EnsureCanLink(shiftEntry, assignmentEntry, selectedUserIds, timeZoneService);
+
+        var link = await db
+            .ShiftAssignmentEntries.Include(existingLink => existingLink.Users)
+            .Include(existingLink => existingLink.ShiftAssignmentSeriesLink)
+                .ThenInclude(seriesLink => seriesLink!.Users)
+            .SingleOrDefaultAsync(
+                existingLink =>
+                    existingLink.ShiftEntryId == shiftEntry.Id && existingLink.AssignmentEntryId == assignmentEntry.Id,
+                cancellationToken
+            );
+
+        if (expectedLinkId.HasValue && link?.Id != expectedLinkId.Value)
+            throw new KeyNotFoundException($"Shift-assignment entry link {expectedLinkId.Value} not found.");
+
+        if (link is not null)
+        {
+            if (!updateExisting)
+                throw new InvalidOperationException("Shift entry is already linked to this assignment entry.");
+
+            db.ShiftAssignmentEntryUsers.RemoveRange(link.Users);
+            ShiftAssignmentUserSync.ReplaceEntryUsers(link, selectedUserIds);
+            ShiftAssignmentUserSync.UpdateExceptionState(link, selectedUserIds);
+        }
+        else
+        {
+            link = ShiftAssignmentUserSync.CreateEntryLink(shiftEntry.Id, assignmentEntry.Id, selectedUserIds);
+            db.ShiftAssignmentEntries.Add(link);
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+        if (validateConflicts)
+        {
+            var conflictCandidates =
+                await SchedulingConflictParticipantProvider.GetParticipantsForAssignmentEntriesAsync(
+                    db,
+                    [assignmentEntry.Id],
+                    cancellationToken
+                );
+            await calendarConflictService.ValidateAndApplyConflictAcknowledgementsAsync(
+                conflictCandidates,
+                conflictOverrides,
+                conflictOverrideActorId,
+                cancellationToken
+            );
+        }
+        if (validateConflicts)
+            await InvalidateAssignmentEntryOverridesAsync([assignmentEntry.Id], cancellationToken);
+
+        logger.LogInformation(
+            "Linked shift entry {ShiftEntryId} to assignment entry {AssignmentEntryId}.",
+            shiftEntry.Id,
+            assignmentEntry.Id
+        );
+
+        return ShiftAssignmentResponseMapper.ToEntryResponse(link, assignmentEntry.Capacity);
+    }
+
+    private async Task<ShiftEntry> LoadShiftEntryAsync(int id, CancellationToken cancellationToken) =>
+        await db
+            .ShiftEntries.Include(entry => entry.Event)
+            .Include(entry => entry.Users)
+            .SingleOrDefaultAsync(entry => entry.Id == id, cancellationToken)
+        ?? throw new KeyNotFoundException($"Shift entry {id} not found.");
+
+    private async Task<AssignmentEntry> LoadAssignmentEntryAsync(int id, CancellationToken cancellationToken) =>
+        await db
+            .AssignmentEntries.Include(entry => entry.Event)
+            .SingleOrDefaultAsync(entry => entry.Id == id, cancellationToken)
+        ?? throw new KeyNotFoundException($"Assignment entry {id} not found.");
+
+    private async Task InvalidateAssignmentEntryOverridesAsync(
+        IEnumerable<int> assignmentEntryIds,
+        CancellationToken cancellationToken
+    )
+    {
+        var ids = assignmentEntryIds.Distinct().ToList();
+        if (ids.Count == 0)
+            return;
+
+        var eventIds = await db
+            .AssignmentEntries.Where(entry => ids.Contains(entry.Id))
+            .Select(entry => entry.EventId)
+            .ToListAsync(cancellationToken);
+        await calendarConflictService.InvalidateResolvedOverridesAsync(
+            eventIds
+                .Select(eventId => new CalendarConflictEventIdentity(
+                    SchedulingConstants.SourceModule,
+                    eventId.ToString()
+                ))
+                .ToList(),
+            cancellationToken: cancellationToken
+        );
+    }
+
+    private async Task InvalidateAssignmentSeriesOverridesAsync(
+        IEnumerable<int> assignmentSeriesIds,
+        CancellationToken cancellationToken
+    )
+    {
+        var ids = assignmentSeriesIds.Distinct().ToList();
+        if (ids.Count == 0)
+            return;
+
+        var eventIds = await db
+            .AssignmentEntries.Where(entry =>
+                entry.AssignmentSeriesId.HasValue && ids.Contains(entry.AssignmentSeriesId.Value)
+            )
+            .Select(entry => entry.EventId)
+            .ToListAsync(cancellationToken);
+        await calendarConflictService.InvalidateResolvedOverridesAsync(
+            eventIds
+                .Select(eventId => new CalendarConflictEventIdentity(
+                    SchedulingConstants.SourceModule,
+                    eventId.ToString()
+                ))
+                .ToList(),
+            cancellationToken: cancellationToken
+        );
+    }
+
+    private void RemoveSeriesLinks(IReadOnlyCollection<ShiftAssignmentSeriesLink> seriesLinks)
+    {
+        if (seriesLinks.Count == 0)
+            return;
+
+        var entryLinks = seriesLinks.SelectMany(link => link.EntryLinks).ToList();
+        RemoveLinks(entryLinks);
+        db.ShiftAssignmentSeriesLinkUsers.RemoveRange(seriesLinks.SelectMany(link => link.Users));
+        db.ShiftAssignmentSeriesLinks.RemoveRange(seriesLinks);
+    }
+
+    private void RemoveLinks(IReadOnlyCollection<ShiftAssignmentEntry> links)
+    {
+        if (links.Count == 0)
+            return;
+
+        db.ShiftAssignmentEntryUsers.RemoveRange(links.SelectMany(link => link.Users));
+        db.ShiftAssignmentEntries.RemoveRange(links);
+    }
+
+    private void SuppressSeriesBackedLinks(IReadOnlyCollection<ShiftAssignmentEntry> links)
+    {
+        if (links.Count == 0)
+            return;
+
+        db.ShiftAssignmentEntryUsers.RemoveRange(links.SelectMany(link => link.Users));
+        foreach (var link in links)
+            link.IsException = true;
+    }
+}

@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "isRoot": true,
+  "tools": {
+    "csharpier": {
+      "version": "1.3.0",
+      "commands": [
+        "csharpier"
+      ],
+      "rollForward": false
+    },
+    "mapster.tool": {
+      "version": "10.0.12",
+      "commands": [
+        "dotnet-mapster"
+      ],
+      "rollForward": false
+    },
+    "nswag.consolecore": {
+      "version": "14.7.1",
+      "commands": [
+        "nswag"
+      ],
+      "rollForward": false
+    }
+  }
+}

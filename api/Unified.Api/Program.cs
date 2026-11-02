@@ -1,0 +1,253 @@
+using System.Text.Json.Serialization;
+using Hangfire;
+using Microsoft.AspNetCore.HttpLogging;
+using Microsoft.AspNetCore.HttpOverrides;
+using Unified.Api.Controllers;
+using Unified.Api.Options;
+using Unified.Api.Services;
+using Unified.Audit;
+using Unified.Authorization;
+using Unified.Authorization.Hangfire;
+using Unified.Calendar;
+using Unified.Calendar.Controllers;
+using Unified.Common.FeatureFlags;
+using Unified.Common.Mvc;
+using Unified.Common.Time;
+using Unified.Core;
+using Unified.Db;
+using Unified.Hangfire;
+using Unified.Hangfire.Options;
+using Unified.Infrastructure;
+using Unified.Infrastructure.Email.Ches;
+using Unified.Infrastructure.OpenApi;
+using Unified.Infrastructure.Options;
+using Unified.JCInterface;
+using Unified.Leave;
+using Unified.Leave.Controllers;
+using Unified.Reporting;
+using Unified.Reporting.Controllers;
+using Unified.Scheduling;
+using Unified.Scheduling.Controllers;
+using Unified.Stats;
+using Unified.Stats.Controllers;
+using Unified.Training;
+using Unified.Training.Controllers;
+using Unified.UserManagement;
+using Unified.UserManagement.Controllers;
+
+var builder = WebApplication.CreateBuilder(args);
+var hangfireOptions =
+    builder.Configuration.GetSection(HangfireOptions.SectionName).Get<HangfireOptions>() ?? new HangfireOptions();
+
+{
+    // Configure forwarded headers so the app sees the external scheme/host
+    // from the nginx reverse proxy. Required for OIDC token exchange to
+    // construct the correct redirect_uri.
+    builder.Services.Configure<ForwardedHeadersOptions>(options =>
+    {
+        options.ForwardedHeaders =
+            ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto | ForwardedHeaders.XForwardedHost;
+        // Trust all proxies (nginx runs in the same pod / overlay network)
+        options.KnownIPNetworks.Clear();
+        options.KnownProxies.Clear();
+    });
+
+    builder
+        .Services.Configure<RouteOptions>(options => options.LowercaseUrls = true)
+        .AddOptions<ApplicationOptions>()
+        .Bind(builder.Configuration.GetSection(ApplicationOptions.SectionName));
+
+    builder.Services.ConfigureHttpJsonOptions(options =>
+    {
+        options.SerializerOptions.NumberHandling = JsonNumberHandling.Strict;
+    });
+
+    builder.Services.AddSingleton<ITimeZoneService, TimeZoneService>();
+    // Logging
+    var enableBodyLogging =
+        builder.Configuration.GetValue<bool>("HttpLogging:LogBodies")
+        && (builder.Environment.IsDevelopment() || builder.Environment.IsEnvironment("Local"));
+
+    builder.Services.AddHttpLogging(options =>
+    {
+        options.LoggingFields =
+            HttpLoggingFields.RequestMethod
+            | HttpLoggingFields.RequestPath
+            | HttpLoggingFields.ResponseStatusCode
+            | HttpLoggingFields.Duration;
+
+        if (enableBodyLogging)
+        {
+            options.LoggingFields |= HttpLoggingFields.RequestBody | HttpLoggingFields.ResponseBody;
+
+            options.RequestBodyLogLimit = 4096;
+            options.ResponseBodyLogLimit = 4096;
+        }
+
+        options.CombineLogs = true;
+    });
+
+    // Modules (core infrastructure first, feature-gated modules conditionally, then Hangfire last)
+    builder
+        .Services.AddInfrastructureModule()
+        .AddChesEmail(builder.Configuration)
+        .AddCoreModule()
+        .AddDbModule(builder.Configuration)
+        .AddAuditModule(builder.Configuration)
+        .AddUserManagementModule(builder.Configuration)
+        .AddCalendarModule(builder.Configuration)
+        .AddSchedulingModule(builder.Configuration)
+        .AddStatsModule(builder.Configuration)
+        .AddTrainingModule(builder.Configuration)
+        .AddReportingModule(builder.Configuration)
+        .AddConfiguredSeedData(
+            builder.Configuration,
+            UserManagementSeedDataSets
+                .All.Concat(StatsSeedDataSets.All)
+                .Concat(TrainingSeedDataSets.All)
+                .Concat(ReportingSeedDataSets.All)
+                .Concat(AuditSeedDataSets.All)
+        )
+        .AddJCInterfaceModule(builder.Configuration)
+        .AddInterceptors();
+    builder.Services.AddLeaveModule(builder.Configuration);
+
+    var mvcBuilder = builder.Services.AddControllers();
+    mvcBuilder.AddChesTestController(builder.Environment, builder.Configuration);
+    mvcBuilder.AddConditionalApplicationPart<CalendarController>(CalendarModule.IsModuleEnabled(builder.Configuration));
+    mvcBuilder.AddConditionalApplicationPart<ShiftController>(SchedulingModule.IsModuleEnabled(builder.Configuration));
+    mvcBuilder.AddConditionalApplicationPart<SchedulingCalendarController>(
+        SchedulingModule.IsModuleEnabled(builder.Configuration)
+    );
+    mvcBuilder.AddConditionalApplicationPart<LeaveTypeController>(LeaveModule.IsModuleEnabled(builder.Configuration));
+    mvcBuilder.AddConditionalApplicationPart<SchedulingLeaveController>(
+        LeaveModule.IsModuleEnabled(builder.Configuration)
+    );
+    mvcBuilder.AddConditionalApplicationPart<StatGroupsController>(StatsModule.IsModuleEnabled(builder.Configuration));
+    mvcBuilder.AddConditionalApplicationPart<UserTrainingController>(
+        TrainingModule.IsModuleEnabled(builder.Configuration)
+    );
+    mvcBuilder.AddConditionalApplicationPart<ReportingController>(
+        ReportingModule.IsModuleEnabled(builder.Configuration)
+    );
+    mvcBuilder.AddConditionalApplicationPart<UsersController>(
+        UserManagementModule.IsModuleEnabled(builder.Configuration)
+    );
+
+    builder.Services.AddSingleton<MigrationAndSeedService>();
+    builder.Services.AddTransient(typeof(SeederFactory<>));
+
+    builder.Services.AddUnifiedOpenApi();
+
+    // CORS mirrors the Probate pattern; origins are comma-separated in config
+    var corsOptions = builder.Configuration.GetSection(CorsOptions.SectionName).Get<CorsOptions>();
+    var allowedOrigins = corsOptions?.AllowedOrigins?.Split(',') ?? [];
+
+    builder.Services.AddCors(options =>
+    {
+        options.AddPolicy(
+            "UnifiedCorsPolicy",
+            policy => policy.WithOrigins(allowedOrigins).AllowAnyMethod().AllowAnyHeader().AllowCredentials()
+        );
+    });
+
+    // Authentication & Authorization
+    builder.Services.AddAuthorizationModule();
+
+    // Hangfire registered last so all feature-gated modules have already registered their IRecurringJob implementations
+    builder.Services.AddHangfireModule(builder.Configuration);
+}
+
+var app = builder.Build();
+{
+    ValidateUniqueFeatureFlagSources(app.Services);
+
+    // Audit.NET's configuration is a process-wide static, so it must be wired up once the
+    // service provider is built rather than during service registration.
+    app.Services.UseAuditModule();
+
+    // Must be first so Request.Scheme, Request.Host, etc. reflect the
+    // external URL for all downstream middleware (OIDC, cookies, etc.).
+    app.UseForwardedHeaders();
+
+    // Base path support
+    var basePath = builder.Configuration["WEB_BASE_HREF"]?.Trim();
+    if (!string.IsNullOrEmpty(basePath))
+    {
+        if (!basePath.StartsWith("/"))
+            basePath = "/" + basePath;
+
+        basePath = basePath.TrimEnd('/');
+
+        if (!string.IsNullOrEmpty(basePath) && basePath != "/")
+            app.UsePathBase(basePath);
+    }
+
+    // Run database migrations
+    var migrationService = app.Services.GetRequiredService<MigrationAndSeedService>();
+    await migrationService.ExecuteMigrationsAndSeeds();
+
+    // Configure the HTTP request pipeline.
+    app.UseExceptionHandler();
+    app.UseUnifiedOpenApi();
+    app.UseHttpsRedirection();
+    app.UseRouting();
+
+    var enableHttpLogging =
+        builder.Configuration.GetValue<bool>("HttpLogging:Enabled")
+        || builder.Environment.IsDevelopment()
+        || builder.Environment.IsEnvironment("Local")
+        || builder.Environment.IsEnvironment("Test");
+
+    if (enableHttpLogging)
+    {
+        app.UseWhen(
+            context =>
+                !context.Request.Path.StartsWithSegments("/health")
+                && !context.Request.Path.StartsWithSegments("/swagger"),
+            branch => branch.UseHttpLogging()
+        );
+    }
+
+    // CORS must be between UseRouting and UseAuthentication
+    app.UseCors("UnifiedCorsPolicy");
+
+    app.UseAuthentication();
+    app.UseAuthorization();
+
+    var hangfireConnectionString = builder.Configuration.GetValue<string>("DatabaseConnectionString");
+    if (hangfireOptions.Enabled && hangfireOptions.DashboardEnabled && !string.IsNullOrEmpty(hangfireConnectionString))
+    {
+        app.UseHangfireDashboard(
+            "/hangfire",
+            new DashboardOptions
+            {
+                Authorization = [new HangfireDashboardAuthorizationFilter()],
+                DisplayStorageConnectionString = false,
+            }
+        );
+    }
+
+    app.MapControllers();
+}
+
+app.Run();
+
+static void ValidateUniqueFeatureFlagSources(IServiceProvider services)
+{
+    var duplicateSources = services
+        .GetServices<IFeatureFlags>()
+        .GroupBy(flag => flag.Source, StringComparer.Ordinal)
+        .Where(group => group.Count() > 1)
+        .Select(group =>
+            $"{group.Key}: {string.Join(", ", group.Select(flag => flag.GetType().Name).Distinct(StringComparer.Ordinal))}"
+        )
+        .ToArray();
+
+    if (duplicateSources.Length == 0)
+        return;
+
+    throw new InvalidOperationException(
+        $"Duplicate IFeatureFlags source registrations detected. Each source must be unique. Conflicts: {string.Join("; ", duplicateSources)}"
+    );
+}

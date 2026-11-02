@@ -1,0 +1,78 @@
+import type {
+  CalendarConflictEventResponse,
+  CalendarConflictResponse,
+  FeatureFlagsResponse,
+  Permissions,
+} from '@/api-access/generated/models';
+
+export type CalendarConflict = CalendarConflictResponse;
+export type CalendarConflictEvent = CalendarConflictEventResponse;
+
+export interface CalendarEventBase {
+  id: string;
+  type: string;
+  sourceModule: string;
+  title: string;
+  description?: string;
+  notes?: string;
+  color?: string;
+  eventSeriesId?: number;
+  start: string;
+  end?: string;
+  seriesStartAtUtc?: string;
+  seriesEndAtUtc?: string;
+  allDay?: boolean;
+  isReadOnly?: boolean;
+  isException?: boolean;
+  holidayType?: string;
+  eventTypeCode?: string;
+  statusTypeCode?: string;
+  cancelledAt?: string;
+  cancelledByUserId?: string;
+  cancellationReason?: string;
+  timeZoneId?: string;
+  locationId?: number;
+  resourceIds?: string[];
+}
+
+export interface CalendarResourceBase {
+  id: string;
+  type: string;
+  sourceModule: string;
+  label: string;
+}
+
+export interface CalendarQueryContext {
+  startDate: string;
+  endDate: string;
+  locationId?: number;
+  filters: Record<string, unknown>;
+}
+
+export interface CalendarRuntimeContext {
+  featureFlags: FeatureFlagsResponse;
+  permissions?: readonly Permissions[];
+}
+
+export interface CalendarContributionData<
+  TEvent extends CalendarEventBase = CalendarEventBase,
+  TResource extends CalendarResourceBase = CalendarResourceBase,
+  TData = unknown,
+> {
+  moduleId: string;
+  contributionId: string;
+  events: TEvent[];
+  resources?: TResource[];
+  data?: TData;
+}
+
+export interface CalendarDataResponse {
+  contributions: Record<string, CalendarContributionData>;
+}
+
+export interface CalendarFullCalendarViewModel {
+  view: 'timeGridDay' | 'timeGridWeek' | 'dayGridMonth';
+  initialDate?: string;
+  events: CalendarEventBase[];
+  weekends?: boolean;
+}

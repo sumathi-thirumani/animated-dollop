@@ -1,0 +1,12 @@
+import { CalendarModuleId } from '../calendarIdentifiers';
+import type { CalendarViewDetailAction } from '../registry/calendarActionRegistryTypes';
+import { useCalendarStore } from '../calendarStore';
+
+export const calendarEventDetailModalAction: CalendarViewDetailAction = {
+  id: 'calendar.event-detail.modal',
+  moduleId: CalendarModuleId.Calendar,
+  run(context) {
+    const calendarStore = useCalendarStore();
+    calendarStore.setSelectedEvent(context.event.id);
+  },
+};

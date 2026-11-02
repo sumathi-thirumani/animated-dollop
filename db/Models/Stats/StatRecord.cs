@@ -1,0 +1,60 @@
+using System.ComponentModel.DataAnnotations;
+using Unified.Db.Models.Abstract;
+using Unified.Db.Models.UserManagement;
+
+namespace Unified.Db.Models.Stats;
+
+public class StatRecord : BaseEntity
+{
+    [Key]
+    public int Id { get; set; }
+
+    public DateOnly DateFrom { get; set; }
+
+    public DateOnly DateTo { get; set; }
+
+    [Required]
+    public string PeriodType { get; set; } = string.Empty;
+
+    public Guid? UserId { get; set; }
+
+    public User? User { get; set; }
+
+    public int LocationId { get; set; }
+
+    public Location? Location { get; set; }
+
+    /// <summary>
+    /// When work was performed at a location other than the user's home location,
+    /// this stores that location. Null means performed at the home location.
+    /// </summary>
+    public int? PerformedAtLocationId { get; set; }
+
+    public Location? PerformedAtLocation { get; set; }
+
+    public int SubCategoryMetricId { get; set; }
+
+    public SubCategoryMetric? SubCategoryMetric { get; set; }
+
+    // Numeric values are assumed for all metrics (see SubCategoryMetric -> StatMetric.UnitOfMeasure).
+    // Supporting non-numeric value types would require new functionality.
+    public decimal? Value { get; set; }
+
+    public string? Comment { get; set; }
+
+    [Required]
+    public string Status { get; set; } = StatRecordStatus.Draft;
+
+    public Guid? SignedOffByUserId { get; set; }
+
+    public User? SignedOffByUser { get; set; }
+
+    public DateTimeOffset? SignedOffAt { get; set; }
+}
+
+public static class StatRecordStatus
+{
+    public const string Draft = "Draft";
+    public const string Submitted = "Submitted";
+    public const string SignedOff = "SignedOff";
+}

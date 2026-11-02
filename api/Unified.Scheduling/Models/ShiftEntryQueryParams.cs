@@ -1,0 +1,16 @@
+namespace Unified.Scheduling.Models;
+
+public sealed record ShiftEntryQueryParams
+{
+    public int? ShiftSeriesId { get; init; }
+
+    public int? EventId { get; init; }
+
+    public Guid? UserId { get; init; }
+
+    public int? LocationId { get; init; }
+
+    public DateTimeOffset? StartAtUtc { get; init; }
+
+    public DateTimeOffset? EndAtUtc { get; init; }
+}

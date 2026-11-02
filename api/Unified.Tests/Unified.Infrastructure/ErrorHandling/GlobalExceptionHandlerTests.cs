@@ -1,0 +1,289 @@
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using FluentValidation;
+using FluentValidation.Results;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Unified.Common.Validation;
+using Unified.Core.Email;
+using Unified.Infrastructure.ErrorHandling;
+using Unified.Tests.TestHelpers;
+
+namespace Unified.Tests.Infrastructure.ErrorHandling;
+
+public class GlobalExceptionHandlerTests
+{
+    [Fact]
+    public async Task TryHandleAsync_Should_Map_ValidationException_To_400_With_Grouped_Errors()
+    {
+        // Arrange
+        var context = CreateHttpContext();
+        var handler = CreateHandler(context);
+        var exception = new ValidationException(
+            new[]
+            {
+                new ValidationFailure("Name", "Name is required") { ErrorCode = "NotEmptyValidator" },
+                new ValidationFailure("Name", "Name is too short") { ErrorCode = "LengthValidator" },
+                new ValidationFailure("Code", "Code is required") { ErrorCode = "NotEmptyValidator" },
+            }
+        );
+
+        // Act
+        var handled = await handler.TryHandleAsync(context, exception, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.True(handled);
+        Assert.Equal(StatusCodes.Status400BadRequest, context.Response.StatusCode);
+
+        var body = await ReadJsonBodyAsync(context);
+        Assert.Equal("Validation failed.", body.RootElement.GetProperty("title").GetString());
+
+        var errors = body.RootElement.GetProperty("errors");
+        var nameErrors = errors.GetProperty("Name").EnumerateArray().Select(x => x.GetString()).ToArray();
+        var codeErrors = errors.GetProperty("Code").EnumerateArray().Select(x => x.GetString()).ToArray();
+
+        Assert.Contains("NotEmptyValidator", nameErrors);
+        Assert.Contains("LengthValidator", nameErrors);
+        Assert.Single(codeErrors);
+        Assert.Equal("NotEmptyValidator", codeErrors[0]);
+    }
+
+    [Fact]
+    public async Task TryHandleAsync_Should_Map_DbUpdateConcurrencyException_To_409()
+    {
+        // Arrange
+        var context = CreateHttpContext();
+        var handler = CreateHandler(context);
+        var exception = new DbUpdateConcurrencyException("conflict");
+
+        // Act
+        var handled = await handler.TryHandleAsync(context, exception, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.True(handled);
+        Assert.Equal(StatusCodes.Status409Conflict, context.Response.StatusCode);
+
+        var body = await ReadJsonBodyAsync(context);
+        Assert.Equal("Conflict.", body.RootElement.GetProperty("title").GetString());
+    }
+
+    [Fact]
+    public async Task TryHandleAsync_Should_Map_ConflictValidationException_To_409_With_FieldErrors()
+    {
+        var context = CreateHttpContext();
+        var handler = CreateHandler(context);
+        var exception = new ConflictValidationException(
+            new Dictionary<string, string[]> { ["AssignmentDefinitionId"] = ["An assignment already exists."] }
+        );
+
+        var handled = await handler.TryHandleAsync(context, exception, TestContext.Current.CancellationToken);
+
+        Assert.True(handled);
+        Assert.Equal(StatusCodes.Status409Conflict, context.Response.StatusCode);
+
+        var body = await ReadJsonBodyAsync(context);
+        Assert.Equal("Conflict.", body.RootElement.GetProperty("title").GetString());
+        Assert.Equal(
+            "An assignment already exists.",
+            body.RootElement.GetProperty("errors").GetProperty("AssignmentDefinitionId")[0].GetString()
+        );
+    }
+
+    [Fact]
+    public async Task TryHandleAsync_Should_Map_Unknown_Exception_To_500_Without_Leaking_Message()
+    {
+        // Arrange
+        var context = CreateHttpContext();
+        var handler = CreateHandler(context);
+        var exception = new Exception("Database password is secret");
+
+        // Act
+        var handled = await handler.TryHandleAsync(context, exception, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.True(handled);
+        Assert.Equal(StatusCodes.Status500InternalServerError, context.Response.StatusCode);
+
+        var body = await ReadJsonBodyAsync(context);
+        Assert.Equal(
+            "An error occurred while processing your request.",
+            body.RootElement.GetProperty("title").GetString()
+        );
+        Assert.Equal("An unexpected server error occurred.", body.RootElement.GetProperty("detail").GetString());
+        Assert.True(body.RootElement.TryGetProperty("traceId", out _));
+    }
+
+    [Fact]
+    public async Task TryHandleAsync_Should_Map_OperationCanceledException_To_499()
+    {
+        // Arrange
+        var context = CreateHttpContext();
+        var handler = CreateHandler(context);
+        var exception = new OperationCanceledException();
+
+        // Act
+        var handled = await handler.TryHandleAsync(context, exception, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.True(handled);
+        Assert.Equal(StatusCodes.Status499ClientClosedRequest, context.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task TryHandleAsync_EmailValidationException_Returns400ProblemDetails()
+    {
+        var context = CreateHttpContext();
+        var handler = CreateHandler(context);
+        var exception = new EmailValidationException("The recipient is invalid.");
+
+        var handled = await handler.TryHandleAsync(context, exception, TestContext.Current.CancellationToken);
+
+        Assert.True(handled);
+        Assert.Equal(StatusCodes.Status400BadRequest, context.Response.StatusCode);
+        var body = await ReadJsonBodyAsync(context);
+        Assert.Equal("Email validation failed.", body.RootElement.GetProperty("title").GetString());
+        Assert.Equal("The recipient is invalid.", body.RootElement.GetProperty("detail").GetString());
+    }
+
+    [Fact]
+    public async Task TryHandleAsync_EmailDeliveryException_Returns502WithoutExposingProviderIdentifiers()
+    {
+        const string tag = "private-provider-tag";
+        const string correlationId = "private-correlation";
+        var context = CreateHttpContext();
+        var logger = new RecordingLogger<GlobalExceptionHandler>();
+        var handler = CreateHandler(context, logger);
+        var exception = new EmailDeliveryException(tag, correlationId, 1, 0, 500);
+
+        var handled = await handler.TryHandleAsync(context, exception, TestContext.Current.CancellationToken);
+
+        Assert.True(handled);
+        Assert.Equal(StatusCodes.Status502BadGateway, context.Response.StatusCode);
+        var body = await ReadJsonBodyAsync(context);
+        Assert.Equal("Email submission failed.", body.RootElement.GetProperty("title").GetString());
+        Assert.Equal(
+            "The email provider did not accept the submission.",
+            body.RootElement.GetProperty("detail").GetString()
+        );
+        Assert.DoesNotContain(tag, body.RootElement.GetRawText(), StringComparison.Ordinal);
+        Assert.DoesNotContain(correlationId, body.RootElement.GetRawText(), StringComparison.Ordinal);
+        var logEntry = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Error);
+        Assert.Equal("Email provider submission failed at the API boundary.", logEntry.Message);
+        Assert.DoesNotContain(tag, logEntry.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(correlationId, logEntry.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TryHandleAsync_EmailDeliveryStateUnknownException_Returns502WithoutSuggestingRetry()
+    {
+        var context = CreateHttpContext();
+        var logger = new RecordingLogger<GlobalExceptionHandler>();
+        var handler = CreateHandler(context, logger);
+        var exception = new EmailDeliveryStateUnknownException(
+            "provider-tag",
+            "correlation",
+            1,
+            0,
+            new HttpRequestException("connection dropped")
+        );
+
+        var handled = await handler.TryHandleAsync(context, exception, TestContext.Current.CancellationToken);
+
+        Assert.True(handled);
+        Assert.Equal(StatusCodes.Status502BadGateway, context.Response.StatusCode);
+        var body = await ReadJsonBodyAsync(context);
+        Assert.Equal("Email submission outcome unknown.", body.RootElement.GetProperty("title").GetString());
+        Assert.Equal(
+            "The email provider did not confirm whether the submission was accepted.",
+            body.RootElement.GetProperty("detail").GetString()
+        );
+        Assert.DoesNotContain("retry", body.RootElement.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        var logEntry = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Error);
+        Assert.Equal("Email provider submission outcome is unknown at the API boundary.", logEntry.Message);
+        Assert.DoesNotContain("provider-tag", logEntry.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("correlation", logEntry.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TryHandleAsync_Should_Map_ForbiddenException_To_403_With_ProblemDetails()
+    {
+        // Arrange
+        var context = CreateHttpContext();
+        var handler = CreateHandler(context);
+        var exception = new ForbiddenException("Missing required permission: ShiftsEdit");
+
+        // Act
+        var handled = await handler.TryHandleAsync(context, exception, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.True(handled);
+        Assert.Equal(StatusCodes.Status403Forbidden, context.Response.StatusCode);
+
+        var body = await ReadJsonBodyAsync(context);
+        Assert.Equal("Access denied.", body.RootElement.GetProperty("title").GetString());
+        Assert.Equal(
+            "You do not have permission to perform this action.",
+            body.RootElement.GetProperty("detail").GetString()
+        );
+        Assert.True(body.RootElement.TryGetProperty("traceId", out _));
+    }
+
+    [Fact]
+    public async Task TryHandleAsync_Should_Map_InvalidDataException_To_400_With_FriendlyDetail()
+    {
+        // Arrange
+        var context = CreateHttpContext();
+        var handler = CreateHandler(context);
+        var exception = new InvalidDataException(
+            "Failed to read the request form. Multipart body length limit 409600 exceeded."
+        );
+
+        // Act
+        var handled = await handler.TryHandleAsync(context, exception, TestContext.Current.CancellationToken);
+
+        // Assert
+        Assert.True(handled);
+        Assert.Equal(StatusCodes.Status400BadRequest, context.Response.StatusCode);
+
+        var body = await ReadJsonBodyAsync(context);
+        Assert.Equal("The uploaded file could not be processed.", body.RootElement.GetProperty("title").GetString());
+        Assert.Equal(
+            "The file exceeds the maximum allowed size of 400 KB.",
+            body.RootElement.GetProperty("detail").GetString()
+        );
+    }
+
+    private static GlobalExceptionHandler CreateHandler(
+        HttpContext context,
+        ILogger<GlobalExceptionHandler>? logger = null
+    )
+    {
+        var services = new ServiceCollection();
+        services.AddOptions();
+        services.AddLogging();
+        services.AddProblemDetails();
+
+        var provider = services.BuildServiceProvider();
+        context.RequestServices = provider;
+
+        var problemDetailsService = provider.GetRequiredService<IProblemDetailsService>();
+
+        return new GlobalExceptionHandler(logger ?? NullLogger<GlobalExceptionHandler>.Instance, problemDetailsService);
+    }
+
+    private static DefaultHttpContext CreateHttpContext()
+    {
+        return new DefaultHttpContext { Response = { Body = new MemoryStream() } };
+    }
+
+    private static async Task<JsonDocument> ReadJsonBodyAsync(HttpContext context)
+    {
+        context.Response.Body.Seek(0, SeekOrigin.Begin);
+        return await JsonDocument.ParseAsync(context.Response.Body);
+    }
+}

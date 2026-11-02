@@ -1,0 +1,53 @@
+using FluentValidation;
+using Unified.Calendar.Validators;
+using Unified.Common.Time;
+using Unified.Scheduling.Models;
+
+namespace Unified.Scheduling.Validators;
+
+public sealed class ShiftEntryRequestValidator : AbstractValidator<ShiftEntryRequest>
+{
+    public ShiftEntryRequestValidator()
+    {
+        RuleFor(request => request.ShiftSeriesId).GreaterThan(0).When(request => request.ShiftSeriesId.HasValue);
+        RuleFor(request => request.Title).NotEmpty().MaximumLength(200);
+        RuleFor(request => request.Description).MaximumLength(2000);
+        RuleFor(request => request.Notes).MaximumLength(4000);
+        RuleFor(request => request.Color).MaximumLength(100);
+        RuleFor(request => request.TimeZoneId).MaximumLength(100).Must(TimeZoneService.IsValidTimeZoneId);
+        RuleFor(request => request.StartAtUtc)
+            .LessThan(request => request.EndAtUtc!.Value)
+            .When(request => request.EndAtUtc.HasValue);
+        RuleFor(request => request.SeriesStartAtUtc)
+            .LessThan(request => request.SeriesEndAtUtc!.Value)
+            .When(request => request.SeriesStartAtUtc.HasValue && request.SeriesEndAtUtc.HasValue);
+        RuleFor(request => request.LocationId).NotEmpty().GreaterThan(0);
+        RuleFor(request => request.UserIds).NotEmpty().Must(HaveDistinctValues);
+        RuleForEach(request => request.UserIds).NotEmpty();
+        RuleFor(request => request.AssignmentEntryLinks)
+            .Must(links =>
+                links is null || links.Select(link => link.AssignmentEntryId).Distinct().Count() == links.Count
+            )
+            .WithMessage("Assignment entry links must be unique.");
+        RuleForEach(request => request.AssignmentEntryLinks!)
+            .SetValidator(new AssignmentEntryLinkRequestValidator())
+            .When(request => request.AssignmentEntryLinks is not null);
+    }
+
+    private static bool HaveDistinctValues(IReadOnlyCollection<Guid>? userIds)
+    {
+        if (userIds is null)
+            return false;
+
+        return userIds.Distinct().Count() == userIds.Count;
+    }
+}
+
+public sealed class ShiftEntryUpdateRequestValidator : AbstractValidator<ShiftEntryUpdateRequest>
+{
+    public ShiftEntryUpdateRequestValidator()
+    {
+        Include(new ShiftEntryRequestValidator());
+        RuleForEach(request => request.ConflictOverrides).SetValidator(new CalendarConflictAcknowledgementValidator());
+    }
+}

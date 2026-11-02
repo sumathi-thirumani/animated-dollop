@@ -1,0 +1,29 @@
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.DependencyInjection;
+using Unified.Audit;
+using Unified.Common.Interceptors;
+using Unified.Common.Interceptors.PostSave;
+
+namespace Unified.Api.Services;
+
+/// <summary>
+/// Registers EF Core interceptors. Auditing itself needs no entry here - <c>UnifiedDbContext</c>
+/// inherits Audit.NET's <c>AuditDbContext</c>, which wraps SaveChanges/SaveChangesAsync directly
+/// (see Unified.Audit's README).
+/// </summary>
+public static class InterceptorRegistration
+{
+    public static IServiceCollection AddInterceptors(this IServiceCollection services)
+    {
+        // Interceptors are executed by EF Core in the order they are registered.
+        // 1. Stamp BaseEntity audit columns so rules, handlers, and the audit trail see final values.
+        services.AddScoped<IInterceptor, AuditableEntityInterceptor>();
+        // 2. Business save rules
+        services.AddScoped<IInterceptor, SaveRulesInterceptor>();
+        // 3. Post-save pipeline reserved for module-agnostic save concerns.
+        // Feature-specific business workflows should use explicit signal dispatch.
+        services.AddScoped<IInterceptor, PostSaveInterceptor>();
+
+        return services;
+    }
+}

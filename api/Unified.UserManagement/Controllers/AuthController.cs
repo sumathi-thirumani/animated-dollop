@@ -1,0 +1,113 @@
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.OpenIdConnect;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using Unified.Authorization;
+using Unified.Authorization.Claims;
+using Unified.UserManagement.Models;
+
+namespace Unified.UserManagement.Controllers;
+
+/// <summary>
+/// Auth controller for handling authentication and token management
+/// </summary>
+[ApiController]
+[Route("api/[controller]")]
+public class AuthController : ControllerBase
+{
+    private readonly ILogger<AuthController> _logger;
+    private readonly IConfiguration _configuration;
+    private readonly IUserAccountResolutionService _userAccountResolutionService;
+
+    public AuthController(
+        ILogger<AuthController> logger,
+        IConfiguration configuration,
+        IUserAccountResolutionService userAccountResolutionService
+    )
+    {
+        _logger = logger;
+        _configuration = configuration;
+        _userAccountResolutionService = userAccountResolutionService;
+    }
+
+    /// <summary>
+    /// Login with credentials and get authentication token
+    /// </summary>
+    /// <param name="redirectUri">The URI to redirect to after successful authentication.</param>
+    /// <returns>A redirect response.</returns>
+    [HttpGet("login")]
+    public async Task<IActionResult> Login(string redirectUri = "/api")
+    {
+        if (!Url.IsLocalUrl(redirectUri))
+            return BadRequest("The redirect URI must be a local path.");
+
+        var safeRedirectUri = Url.Content(redirectUri);
+
+        await HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+        return Challenge(
+            new AuthenticationProperties { RedirectUri = safeRedirectUri },
+            OpenIdConnectDefaults.AuthenticationScheme
+        );
+    }
+
+    /// <summary>
+    /// Log out the current user by clearing the authentication cookie and signing out of the identity provider
+    /// </summary>
+    [HttpGet("logout")]
+    public IActionResult Logout()
+    {
+        return SignOut(
+            new AuthenticationProperties { RedirectUri = "/" },
+            CookieAuthenticationDefaults.AuthenticationScheme,
+            OpenIdConnectDefaults.AuthenticationScheme
+        );
+    }
+
+    /// <summary>
+    /// Gets the current authenticated user's information including their permissions
+    /// </summary>
+    [HttpGet("user")]
+    [Authorize]
+    public async Task<ActionResult<UserInfo>> GetUserInfo(CancellationToken cancellationToken = default)
+    {
+        await _userAccountResolutionService.UpdateCurrentUserLastLoginAsync(User, cancellationToken);
+
+        var claims = User.Claims.Select(c => new UserClaim(c.Type, c.Value)).ToList();
+
+        var permissions = claims
+            .Where(c => c.Type == UnifiedClaimTypes.Permission)
+            .Select(c => Enum.TryParse<Permissions>(c.Value, out var parsed) ? parsed : (Permissions?)null)
+            .Where(p => p.HasValue)
+            .Select(p => p!.Value)
+            .ToList();
+
+        var userIdValue = User.FindFirst(UnifiedClaimTypes.UserId)?.Value;
+        var userId = Guid.TryParse(userIdValue, out var parsed) ? parsed : (Guid?)null;
+
+        var homeLocationIdValue = User.FindFirst(UnifiedClaimTypes.HomeLocationId)?.Value;
+        var homeLocationId = int.TryParse(homeLocationIdValue, out var parsedLocationId)
+            ? parsedLocationId
+            : (int?)null;
+
+        var firstName = User.FindFirst(UnifiedClaimTypes.FirstName)?.Value;
+        var lastName = User.FindFirst(UnifiedClaimTypes.LastName)?.Value;
+        var name = string.Join(" ", new[] { firstName, lastName }.Where(s => !string.IsNullOrWhiteSpace(s)));
+
+        var user = new UserInfo(
+            User.Identity?.IsAuthenticated ?? false,
+            userId.HasValue,
+            string.IsNullOrWhiteSpace(name) ? User.Identity?.Name : name,
+            User.Identity?.AuthenticationType,
+            claims,
+            permissions,
+            userId,
+            homeLocationId
+        );
+
+        return Ok(user);
+    }
+}

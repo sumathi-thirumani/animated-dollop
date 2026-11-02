@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Unified.Tests</RootNamespace>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.12" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="10.0.12" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.12" />
+    <PackageReference Include="xunit.v3.mtp-v2" Version="4.0.1" />
+    <PackageReference Include="Hangfire.InMemory" Version="1.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Unified.Api\Unified.Api.csproj" />
+    <ProjectReference Include="..\Unified.Calendar\Unified.Calendar.csproj" />
+    <ProjectReference Include="..\Unified.Core\Unified.Core.csproj" />
+    <ProjectReference Include="..\Unified.Common\Unified.Common.csproj" />
+    <ProjectReference Include="..\Unified.Hangfire\Unified.Hangfire.csproj" />
+    <ProjectReference Include="..\Unified.Infrastructure\Unified.Infrastructure.csproj" />
+    <ProjectReference Include="..\Unified.JCInterface\Unified.JCInterface.csproj" />
+    <ProjectReference Include="..\Unified.Training\Unified.Training.csproj" />
+    <ProjectReference Include="..\Unified.Scheduling\Unified.Scheduling.csproj" />
+    <ProjectReference Include="..\Unified.UserManagement\Unified.UserManagement.csproj" />
+    <ProjectReference Include="..\Unified.Api\Unified.Api.csproj" />
+    <ProjectReference Include="..\..\db\db.csproj" />
+  </ItemGroup>
+</Project>

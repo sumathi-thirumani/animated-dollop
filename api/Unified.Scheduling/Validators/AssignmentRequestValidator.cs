@@ -1,0 +1,93 @@
+using System.Linq.Expressions;
+using FluentValidation;
+using Unified.Calendar.Validators;
+using Unified.Common.Time;
+using Unified.Scheduling.Models;
+
+namespace Unified.Scheduling.Validators;
+
+public sealed class AssignmentSeriesRequestValidator : AbstractValidator<AssignmentSeriesRequest>
+{
+    public AssignmentSeriesRequestValidator()
+    {
+        RuleFor(request => request.AssignmentDefinitionId).GreaterThan(0);
+        RuleFor(request => request.Title).NotEmpty().MaximumLength(200);
+        RuleFor(request => request.Description).MaximumLength(2000);
+        RuleFor(request => request.Notes).MaximumLength(4000);
+        RuleFor(request => request.Color).NotEmpty().MaximumLength(100);
+        RuleFor(request => request.TimeZoneId).MaximumLength(100).Must(TimeZoneService.IsValidTimeZoneId);
+        RuleFor(request => request.StartAtUtc).NotEmpty();
+        RuleFor(request => request.EndAtUtc).NotEmpty().GreaterThan(request => request.StartAtUtc);
+        RuleFor(request => request.LocationId).NotEmpty().GreaterThan(0);
+        RuleFor(request => request.CategoryId).GreaterThan(0);
+        RuleFor(request => request.SubCategoryId).GreaterThan(0);
+        RuleFor(request => request.Capacity).GreaterThanOrEqualTo(0);
+        RuleFor(request => request.RecurrenceRule).NotEmpty();
+        RuleForEach(request => request.ShiftSeriesLinks).SetValidator(new ShiftSeriesLinkRequestValidator());
+        RuleFor(request => request.ShiftSeriesLinks)
+            .Must(links => links is null || links.Select(link => link.ShiftSeriesId).Distinct().Count() == links.Count)
+            .WithMessage("Shift series links must be unique.");
+    }
+}
+
+public sealed class AssignmentEntryRequestValidator : AbstractValidator<AssignmentEntryRequest>
+{
+    public AssignmentEntryRequestValidator()
+    {
+        RuleFor(request => request.AssignmentSeriesId)
+            .GreaterThan(0)
+            .When(request => request.AssignmentSeriesId.HasValue);
+        RuleFor(request => request.AssignmentDefinitionId).GreaterThan(0);
+        RuleFor(request => request.Title).NotEmpty().MaximumLength(200);
+        RuleFor(request => request.Description).MaximumLength(2000);
+        RuleFor(request => request.Notes).MaximumLength(4000);
+        RuleFor(request => request.Color).NotEmpty().MaximumLength(100);
+        RuleFor(request => request.TimeZoneId).MaximumLength(100).Must(TimeZoneService.IsValidTimeZoneId);
+        RuleFor(request => request.StartAtUtc).NotEmpty();
+        RuleFor(request => request.EndAtUtc).NotEmpty().GreaterThan(request => request.StartAtUtc);
+        RuleFor(request => request.SeriesStartAtUtc)
+            .LessThan(request => request.SeriesEndAtUtc!.Value)
+            .When(request => request.SeriesStartAtUtc.HasValue && request.SeriesEndAtUtc.HasValue);
+        RuleFor(request => request.LocationId).NotNull().GreaterThan(0);
+        RuleFor(request => request.CategoryId).GreaterThan(0);
+        RuleFor(request => request.SubCategoryId).GreaterThan(0);
+        RuleFor(request => request.Capacity).GreaterThanOrEqualTo(0);
+        this.AddShiftEntryLinkRules(request => request.ShiftEntryLinks);
+    }
+}
+
+public sealed class AssignmentEntryUpdateRequestValidator : AbstractValidator<AssignmentEntryUpdateRequest>
+{
+    public AssignmentEntryUpdateRequestValidator()
+    {
+        RuleFor(request => request.AssignmentDefinitionId).GreaterThan(0);
+        RuleFor(request => request.Title).NotEmpty().MaximumLength(200);
+        RuleFor(request => request.Description).MaximumLength(2000);
+        RuleFor(request => request.Notes).MaximumLength(4000);
+        RuleFor(request => request.Color).NotEmpty().MaximumLength(100);
+        RuleFor(request => request.TimeZoneId).MaximumLength(100).Must(TimeZoneService.IsValidTimeZoneId);
+        RuleFor(request => request.StartAtUtc).NotEmpty();
+        RuleFor(request => request.EndAtUtc).NotEmpty().GreaterThan(request => request.StartAtUtc);
+        RuleFor(request => request.LocationId).NotNull().GreaterThan(0);
+        RuleFor(request => request.CategoryId).GreaterThan(0);
+        RuleFor(request => request.SubCategoryId).GreaterThan(0);
+        RuleFor(request => request.Capacity).GreaterThanOrEqualTo(0);
+        this.AddShiftEntryLinkRules(request => request.ShiftEntryLinks);
+        RuleForEach(request => request.ConflictOverrides).SetValidator(new CalendarConflictAcknowledgementValidator());
+    }
+}
+
+internal static class AssignmentRequestValidatorExtensions
+{
+    public static void AddShiftEntryLinkRules<TRequest>(
+        this AbstractValidator<TRequest> validator,
+        Expression<Func<TRequest, IEnumerable<ShiftEntryLinkRequest>?>> linksSelector
+    )
+    {
+        validator
+            .RuleFor(linksSelector)
+            .Must(links => links is null || links.Select(link => link.ShiftEntryId).Distinct().Count() == links.Count())
+            .WithMessage("Shift entry links must be unique.");
+        validator.RuleForEach(linksSelector).SetValidator(new ShiftEntryLinkRequestValidator());
+    }
+}

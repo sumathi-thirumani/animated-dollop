@@ -1,0 +1,410 @@
+import { DateTime, type DateTimeFormatOptions } from 'luxon';
+
+export const DATE_FORMAT = 'yyyy-MM-dd';
+
+const calendarDateOnlyFormat = {
+  month: 'long',
+  day: 'numeric',
+  year: 'numeric',
+} as const satisfies DateTimeFormatOptions;
+
+const calendarMonthFormat = {
+  month: 'long',
+  year: 'numeric',
+} as const satisfies DateTimeFormatOptions;
+
+const calendarTimeFormat = {
+  hour: 'numeric',
+  minute: '2-digit',
+} as const satisfies DateTimeFormatOptions;
+
+export type CalendarDateOptions = {
+  /**
+   * When true, keeps the zone/offset from the source value.
+   * When false, converts to local zone before formatting.
+   */
+  setZone?: boolean;
+};
+
+export type CalendarPeriodValue = 'day' | 'week' | 'work-week' | 'month';
+export type CalendarNavigationDirection = 'previous' | 'next';
+
+export type CalendarDateRange = {
+  startDate: string;
+  endDate: string;
+};
+
+export function parseDateInput(value: string) {
+  return DateTime.fromFormat(value, DATE_FORMAT);
+}
+
+export function parseLocalDateTime(value: string) {
+  return DateTime.fromISO(value, { zone: 'local' }).startOf('day');
+}
+
+export function toDateTime(value: string | Date, timeZone?: string) {
+  if (value instanceof Date) {
+    const options = timeZone ? { zone: timeZone } : undefined;
+    const dateTime = DateTime.fromJSDate(value, options);
+
+    return timeZone ? dateTime.setZone(timeZone) : dateTime;
+  }
+
+  const dateTime = DateTime.fromISO(value, { setZone: true });
+
+  return timeZone ? dateTime.setZone(timeZone) : dateTime;
+}
+
+export function formatDateTime(value: DateTime, locale: string, format: DateTimeFormatOptions) {
+  if (!value.isValid) {
+    return '';
+  }
+
+  return normalizeMeridiem(value.setLocale(locale).toLocaleString(format));
+}
+
+export function normalizeMeridiem(value: string) {
+  return value.replace(/\s*a\.m\./i, ' AM').replace(/\s*p\.m\./i, ' PM');
+}
+
+export function hasExplicitTimeZoneOffset(value: string) {
+  return /(?:z|[+-]\d{2}:?\d{2})$/i.test(value);
+}
+
+/**
+ * Returns a yyyy-MM-dd calendar date from an ISO-like date value.
+ *
+ * Zone behavior:
+ * - setZone = true (default): keep source offset/zone before extracting date
+ * - setZone = false: convert to local zone before extracting date
+ *
+ * Examples:
+ * - toCalendarDateString("2024-01-01T00:30:00Z") => "2024-01-01"
+ * - toCalendarDateString("2024-01-01T00:30:00Z", { setZone: false })
+ *   may become "2023-12-31" in a negative local timezone
+ * - toCalendarDateString("2024-01-01T00:00:00-08:00", { setZone: true }) => "2024-01-01"
+ * - "2024-01-01" => "2024-01-01"
+ * - null/undefined => null
+ */
+export function toCalendarDateString(dateValue?: string | null, options?: CalendarDateOptions): string | null {
+  if (!dateValue) {
+    return null;
+  }
+
+  const parsed = DateTime.fromISO(dateValue, { setZone: options?.setZone ?? true });
+  return parsed.isValid ? parsed.toISODate() : null;
+}
+
+/**
+ * Extracts yyyy-MM-dd for form input values.
+ *
+ * Defaults to preserve source zone/offset to avoid date drift.
+ * Pass { setZone: false } to derive date in local zone.
+ */
+export function toDateInputValue(isoDateString?: string | null, options?: CalendarDateOptions): string | null {
+  return toCalendarDateString(isoDateString, options);
+}
+
+/**
+ * Get today's date in the format yyyy-MM-dd.
+ */
+export function getTodayDateInputValue(): string {
+  return DateTime.now().toFormat(DATE_FORMAT);
+}
+
+export function getTodayDateOnly(): string {
+  return getTodayDateInputValue();
+}
+
+/**
+ * Convert date input (yyyy-MM-dd) to API date string.
+ * Frontend sends date strings only; backend handles timezone conversion.
+ */
+export function toApiDateString(dateInput: string): string {
+  // Validate the format
+  const dt = parseDateInput(dateInput);
+  if (!dt.isValid) {
+    throw new Error(`Invalid date format. Expected ${DATE_FORMAT}, got ${dateInput}`);
+  }
+  return dateInput;
+}
+
+/**
+ * Extracts HH:mm time from an ISO datetime string, preserving source zone/offset.
+ * Returns null for full-day sentinel times (midnight 00:00 or end-of-day 23:59) or if the input is invalid.
+ * Pass { setZone: false } to derive time in local zone.
+ */
+export function toTimeInputValue(isoDateString?: string | null, options?: CalendarDateOptions): string | null {
+  if (!isoDateString) return null;
+
+  const parsed = DateTime.fromISO(isoDateString, { setZone: options?.setZone ?? true });
+  if (!parsed.isValid) return null;
+
+  const hh = String(parsed.hour).padStart(2, '0');
+  const mm = String(parsed.minute).padStart(2, '0');
+  const time = `${hh}:${mm}`;
+
+  // Treat midnight (00:00) or end-of-day (23:59) as full-day sentinels — no time component
+  return time === '00:00' || time === '23:59' ? null : time;
+}
+
+/**
+ * Determines if a datetime range represents a full-day entry.
+ *
+ * Mirrors the isDateFullday filter from sheriff-scheduling:
+ * Returns true when both start and end times are midnight (00:00), or when either value is absent.
+ */
+export function isDateTimeFullDay(startIso?: string | null, endIso?: string | null): boolean {
+  return toTimeInputValue(startIso) === null && toTimeInputValue(endIso) === null;
+}
+
+/**
+ * Combines a date input (yyyy-MM-dd) and an optional time input (HH:mm) into a
+ * local datetime string (yyyy-MM-ddTHH:mm) suitable for the API.
+ *
+ * When no time is supplied, midnight (T00:00) is used — representing a full-day entry.
+ *
+ * Examples:
+ * - ('2026-01-10', '08:30') => '2026-01-10T08:30'
+ * - ('2026-01-10', '')      => '2026-01-10T00:00'
+ * - ('2026-01-10')          => '2026-01-10T00:00'
+ */
+export function toLocalDateTimeString(date: string, time?: string): string {
+  const d = DateTime.fromFormat(date, DATE_FORMAT);
+  if (!d.isValid) {
+    throw new Error(`Invalid date: ${date}`);
+  }
+
+  if (time) {
+    const t = DateTime.fromFormat(time, 'HH:mm');
+    if (!t.isValid) {
+      throw new Error(`Invalid time: ${time}`);
+    }
+    return d.set({ hour: t.hour, minute: t.minute }).toFormat(`${DATE_FORMAT}'T'HH:mm`);
+  }
+
+  return d.toFormat(`${DATE_FORMAT}'T'HH:mm`);
+}
+
+/**
+ * Converts a date input (yyyy-MM-dd) and an optional time input (HH:mm) to an
+ * ISO 8601 string with the UTC offset for the given IANA timezone.
+ *
+ * When no time is supplied, midnight (start of day) is used — representing a full-day entry.
+ * Falls back to local time when timezone is absent or invalid.
+ *
+ * Examples (timezone = 'America/Vancouver', offset -08:00 in winter):
+ * - ('2026-01-10', '08:30', 'America/Vancouver') => '2026-01-10T08:30:00.000-08:00'
+ * - ('2026-01-10', '',      'America/Vancouver') => '2026-01-10T00:00:00.000-08:00'
+ */
+export function toOffsetDateTimeString(
+  date: string,
+  time: string | undefined,
+  timezone: string | null | undefined,
+): string {
+  const zone = timezone || 'local';
+  const d = DateTime.fromFormat(date, DATE_FORMAT, { zone });
+  if (!d.isValid) {
+    throw new Error(`Invalid date: ${date}`);
+  }
+
+  if (time) {
+    const t = DateTime.fromFormat(time, 'HH:mm');
+    if (!t.isValid) {
+      throw new Error(`Invalid time: ${time}`);
+    }
+    return d.set({ hour: t.hour, minute: t.minute, second: 0, millisecond: 0 }).toISO()!;
+  }
+
+  return d.startOf('day').toUTC().toISO()!;
+}
+
+/**
+ * Compare two date inputs (yyyy-MM-dd format).
+ * Returns true if left date is before right date.
+ */
+export function isDateInputBefore(left: string, right: string): boolean {
+  const leftDate = parseDateInput(left);
+  const rightDate = parseDateInput(right);
+  return leftDate.isValid && rightDate.isValid && leftDate < rightDate;
+}
+
+/**
+ * Check if a date is in the past (yesterday or earlier).
+ *
+ * Uses the same zone behavior options as toCalendarDateString.
+ */
+export function isDateInputHistorical(dateInput?: string | null, options?: CalendarDateOptions): boolean {
+  const normalizedDateInput = toCalendarDateString(dateInput, options);
+  if (!normalizedDateInput) return false;
+
+  const date = parseDateInput(normalizedDateInput);
+  const today = DateTime.now().startOf('day');
+  return date.isValid && date < today;
+}
+
+export function parseLocalDateOnly(value: string): Date {
+  return parseLocalDateTime(value).toJSDate();
+}
+
+export function formatLocalDateOnly(value: Date): string {
+  return DateTime.fromJSDate(value).toISODate() ?? '';
+}
+
+export function addDays(value: string, days: number): string {
+  return parseLocalDateTime(value).plus({ days }).toISODate() ?? value;
+}
+
+export function addMonths(value: string, months: number): string {
+  return parseLocalDateTime(value).plus({ months }).toISODate() ?? value;
+}
+
+export function startOfWeek(value: string): string {
+  return parseLocalDateTime(value).startOf('week').toISODate() ?? value;
+}
+
+export function startOfMonth(value: string): string {
+  return parseLocalDateTime(value).startOf('month').toISODate() ?? value;
+}
+
+export function buildDateRangeForPeriod(anchorDate: string, currentPeriod: CalendarPeriodValue): CalendarDateRange {
+  switch (currentPeriod) {
+    case 'day':
+      return {
+        startDate: anchorDate,
+        endDate: addDays(anchorDate, 1),
+      };
+    case 'work-week': {
+      const startDate = startOfWeek(anchorDate);
+      return {
+        startDate,
+        endDate: addDays(startDate, 5),
+      };
+    }
+    case 'month': {
+      const startDate = startOfMonth(anchorDate);
+      return {
+        startDate,
+        endDate: addMonths(startDate, 1),
+      };
+    }
+    case 'week':
+    default: {
+      const startDate = startOfWeek(anchorDate);
+      return {
+        startDate,
+        endDate: addDays(startDate, 7),
+      };
+    }
+  }
+}
+
+export function shiftCalendarAnchor(
+  anchorDate: string,
+  period: CalendarPeriodValue,
+  direction: CalendarNavigationDirection,
+): string {
+  const multiplier = direction === 'next' ? 1 : -1;
+
+  switch (period) {
+    case 'day':
+      return addDays(anchorDate, multiplier);
+    case 'work-week':
+    case 'week':
+      return addDays(anchorDate, multiplier * 7);
+    case 'month':
+      return addMonths(anchorDate, multiplier);
+  }
+}
+
+export function formatRangeLabel(startDate: string, endDate: string, currentPeriod: CalendarPeriodValue): string {
+  const start = parseLocalDateTime(startDate);
+
+  if (currentPeriod === 'month') {
+    return formatDateTime(start, 'en-CA', calendarMonthFormat);
+  }
+
+  if (currentPeriod === 'day') {
+    return formatDateTime(start, 'en-CA', calendarDateOnlyFormat);
+  }
+
+  return `${formatDateTime(start, 'en-CA', calendarDateOnlyFormat)} - ${formatDateTime(parseLocalDateTime(addDays(endDate, -1)), 'en-CA', calendarDateOnlyFormat)}`;
+}
+
+export function localDateOnlyToUtcInstant(value: string): string {
+  return DateTime.fromISO(value, { zone: 'utc' }).startOf('day').toISO() ?? '';
+}
+
+export function toCalendarDateOnly(value?: string | null): string | undefined {
+  return toCalendarDateString(value) ?? undefined;
+}
+
+export function formatCalendarDateOnly(value: string, locale = 'en-CA'): string {
+  return formatDateTime(parseLocalDateTime(value), locale, calendarDateOnlyFormat);
+}
+
+export function formatCalendarDateTimeDate(value: string | Date, timeZone = 'UTC', locale = 'en-CA'): string {
+  return formatDateTime(toDateTime(value, timeZone), locale, calendarDateOnlyFormat);
+}
+
+export function formatCalendarTime(value: string | Date, timeZone = 'UTC', locale = 'en-CA'): string {
+  return formatDateTime(toDateTime(value, timeZone), locale, calendarTimeFormat);
+}
+
+export function formatCalendarEventDate(
+  value: string,
+  options: {
+    allDay?: boolean;
+    timeZone?: string;
+    locale?: string;
+  } = {},
+): string {
+  const { allDay = false, timeZone = 'UTC', locale = 'en-CA' } = options;
+
+  return allDay ? formatCalendarDateOnly(value, locale) : formatCalendarDateTimeDate(value, timeZone, locale);
+}
+
+export function formatCalendarEventTimeRange(
+  start: string | Date,
+  end?: string | Date,
+  options: {
+    allDay?: boolean;
+    timeZone?: string;
+    locale?: string;
+    allDayLabel?: string;
+  } = {},
+): string {
+  const { allDay = false, timeZone, locale = 'en-CA', allDayLabel = 'All day' } = options;
+
+  if (allDay) {
+    return allDayLabel;
+  }
+
+  const formattedStart = formatCalendarTime(start, timeZone, locale);
+  const formattedEnd = end ? formatCalendarTime(end, timeZone, locale) : undefined;
+
+  return formattedEnd ? `${formattedStart} - ${formattedEnd}` : formattedStart;
+}
+
+export function formatCalendarDateTimeRange(
+  start: string | Date,
+  end: string | Date,
+  timeZone = 'UTC',
+  locale = 'en-CA',
+) {
+  const startDateTime = toDateTime(start, timeZone);
+  const endDateTime = toDateTime(end, timeZone);
+  if (!startDateTime.isValid || !endDateTime.isValid) {
+    return '';
+  }
+
+  const startDate = formatDateTime(startDateTime, locale, calendarDateOnlyFormat);
+  const startTime = formatDateTime(startDateTime, locale, calendarTimeFormat);
+  const endTime = formatDateTime(endDateTime, locale, calendarTimeFormat);
+  if (startDateTime.hasSame(endDateTime, 'day')) {
+    return `${startDate}, ${startTime} - ${endTime}`;
+  }
+
+  const endDate = formatDateTime(endDateTime, locale, calendarDateOnlyFormat);
+  return `${startDate}, ${startTime} - ${endDate}, ${endTime}`;
+}

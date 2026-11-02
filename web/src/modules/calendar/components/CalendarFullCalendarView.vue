@@ -1,0 +1,56 @@
+<script setup lang="ts">
+import type { EventClickInfo, EventInput } from '@fullcalendar/vue3';
+import { computed } from 'vue';
+import '@/assets/styles/calendar.fullcalendar.css';
+import UaCalendar from '@/shared/components/UaCalendar.vue';
+import type { CalendarEventBase, CalendarFullCalendarViewModel } from '../calendarTypes';
+
+const props = defineProps<{
+  model: CalendarFullCalendarViewModel;
+}>();
+
+const emit = defineEmits<{
+  (event: 'eventClick', payload: CalendarEventBase): void;
+}>();
+
+const events = computed<EventInput[]>(() =>
+  props.model.events.map((event) => ({
+    id: event.id,
+    title: event.title,
+    start: event.start,
+    end: event.end,
+    allDay: event.allDay,
+    editable: event.isReadOnly ? false : undefined,
+    extendedProps: {
+      calendarEvent: event,
+      type: event.type,
+      sourceModule: event.sourceModule,
+      description: event.description,
+      eventTypeCode: event.eventTypeCode,
+      statusTypeCode: event.statusTypeCode,
+      isReadOnly: event.isReadOnly,
+      holidayType: event.holidayType,
+    },
+  })),
+);
+
+const handleEventClick = (arg: EventClickInfo) => {
+  const calendarEvent = arg.event.extendedProps['calendarEvent'];
+
+  if (calendarEvent) {
+    emit('eventClick', calendarEvent as CalendarEventBase);
+  }
+};
+</script>
+
+<template>
+  <div class="calendar-full-calendar-view">
+    <UaCalendar
+      :events="events"
+      :view="model.view"
+      :initial-date="model.initialDate"
+      :weekends="model.weekends"
+      @event-click="handleEventClick"
+    />
+  </div>
+</template>

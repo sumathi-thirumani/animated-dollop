@@ -1,0 +1,358 @@
+using Microsoft.EntityFrameworkCore;
+using Unified.Db;
+using Unified.Db.Models.Training;
+using Unified.Tests.TestHelpers;
+using Unified.Training.Models;
+using Unified.Training.Services.Lookup;
+using LookupCodeTypes = Unified.Core.Models.LookupCodeTypes;
+using TrainingEntity = Unified.Db.Models.Training.Training;
+
+namespace Unified.Tests.Core.Services.Lookup;
+
+public class TrainingLookupStrategyTests : IAsyncLifetime
+{
+    private UnifiedDbContext _dbContext = null!;
+    private TrainingLookupStrategy _strategy = null!;
+
+    public async ValueTask InitializeAsync()
+    {
+        var options = new DbContextOptionsBuilder<UnifiedDbContext>()
+            .UseSqlite("Data Source=:memory:;Cache=Shared;Mode=Memory;")
+            .Options;
+
+        _dbContext = new SqliteTestUnifiedDbContext(options);
+        await _dbContext.Database.OpenConnectionAsync();
+        await _dbContext.Database.EnsureCreatedAsync();
+
+        _dbContext.TrainingCategories.Add(new TrainingCategory { Id = 1, Name = "Mandatory" });
+        await _dbContext.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        _strategy = new TrainingLookupStrategy(_dbContext);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _dbContext.Database.CloseConnectionAsync();
+        await _dbContext.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task GetAllAsync_Should_Return_Trainings_In_Order()
+    {
+        _dbContext.Trainings.AddRange(
+            new TrainingEntity
+            {
+                Code = "E",
+                Description = "Entry",
+                Order = 1,
+                EffectiveDate = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            },
+            new TrainingEntity
+            {
+                Code = "A",
+                Description = "Annual",
+                Order = 0,
+                EffectiveDate = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            }
+        );
+
+        await _dbContext.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        var result = await _strategy.GetAllAsync(TestContext.Current.CancellationToken);
+
+        Assert.Collection(result, first => Assert.Equal("A", first.Code), second => Assert.Equal("E", second.Code));
+    }
+
+    [Fact]
+    public async Task GetAllTrainingsAsync_Should_Exclude_Expired_By_Default()
+    {
+        _dbContext.Trainings.AddRange(
+            new TrainingEntity
+            {
+                Code = "ACTIVE",
+                Description = "Active training",
+                Order = 0,
+                EffectiveDate = DateTimeOffset.UtcNow.AddDays(-5),
+                ExpiryDate = null,
+            },
+            new TrainingEntity
+            {
+                Code = "EXPIRED",
+                Description = "Expired training",
+                Order = 1,
+                EffectiveDate = DateTimeOffset.UtcNow.AddDays(-10),
+                ExpiryDate = DateTimeOffset.UtcNow.AddDays(-1),
+            }
+        );
+
+        await _dbContext.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        var result = await _strategy.GetAllTrainingsAsync(cancellationToken: TestContext.Current.CancellationToken);
+
+        var onlyTraining = Assert.Single(result);
+        Assert.Equal("ACTIVE", onlyTraining.Code);
+    }
+
+    [Fact]
+    public async Task GetAllTrainingsAsync_WhenIncludeExpired_IsTrue_Should_Return_All()
+    {
+        _dbContext.Trainings.AddRange(
+            new TrainingEntity
+            {
+                Code = "ACTIVE",
+                Description = "Active training",
+                Order = 0,
+                EffectiveDate = DateTimeOffset.UtcNow.AddDays(-5),
+                ExpiryDate = null,
+            },
+            new TrainingEntity
+            {
+                Code = "EXPIRED",
+                Description = "Expired training",
+                Order = 1,
+                EffectiveDate = DateTimeOffset.UtcNow.AddDays(-10),
+                ExpiryDate = DateTimeOffset.UtcNow.AddDays(-1),
+            }
+        );
+
+        await _dbContext.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        var result = await _strategy.GetAllTrainingsAsync(true, TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, result.Count);
+    }
+
+    [Fact]
+    public async Task GetAllTrainingsAsync_Should_Include_Mandatory_Training_Profiles()
+    {
+        var profile = await SeedTrainingProfileAsync("CARBINE", "Carbine Operator");
+
+        _dbContext.Trainings.Add(
+            new TrainingEntity
+            {
+                Code = "MANDATORY-CARBINE",
+                Description = "Mandatory for carbine profile",
+                Mandatory = true,
+                Order = 0,
+                EffectiveDate = DateTimeOffset.UtcNow.AddDays(-1),
+                TrainingProfileRequirements = [new TrainingProfileRequirement { TrainingProfileTypeId = profile.Id }],
+            }
+        );
+
+        await _dbContext.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        var result = await _strategy.GetAllTrainingsAsync(cancellationToken: TestContext.Current.CancellationToken);
+
+        var training = Assert.Single(result);
+        Assert.True(training.Mandatory);
+        Assert.Equal([profile.Id], training.MandatoryTrainingProfiles.Select(profileType => profileType.Id));
+        Assert.Equal(["CARBINE"], training.MandatoryTrainingProfiles.Select(profileType => profileType.Code));
+    }
+
+    [Fact]
+    public async Task CreateAsync_Should_Create_Training_Response()
+    {
+        var profile = await SeedTrainingProfileAsync("CARBINE", "Carbine Operator");
+
+        var result = await _strategy.CreateAsync(
+            new TrainingLookupRequest
+            {
+                Code = " FIRE ",
+                Description = " Firearms Qualification ",
+                TrainingCategoryId = 1,
+                ValidityDays = 365,
+                Mandatory = true,
+                MandatoryTrainingProfileIds = [profile.Id],
+            },
+            TestContext.Current.CancellationToken
+        );
+
+        Assert.True(result.Id > 0);
+        Assert.Equal("FIRE", result.Code);
+        Assert.Equal("Firearms Qualification", result.Description);
+        Assert.Equal(1, result.TrainingCategoryId);
+        Assert.Equal("Mandatory", result.TrainingCategoryName);
+        Assert.True(result.Mandatory);
+        Assert.Equal([profile.Id], result.MandatoryTrainingProfiles.Select(profileType => profileType.Id));
+        Assert.Equal(["CARBINE"], result.MandatoryTrainingProfiles.Select(profileType => profileType.Code));
+    }
+
+    [Fact]
+    public async Task UpdateAsync_Should_Clear_Mandatory_Training_Profiles_When_Training_Is_Not_Mandatory()
+    {
+        var profile = await SeedTrainingProfileAsync("CARBINE", "Carbine Operator");
+        var created = await _strategy.CreateAsync(
+            new TrainingLookupRequest
+            {
+                Code = "MAND-PROFILE",
+                Description = "Profile Mandatory",
+                Mandatory = true,
+                MandatoryTrainingProfileIds = [profile.Id],
+            },
+            TestContext.Current.CancellationToken
+        );
+
+        var updated = await _strategy.UpdateAsync(
+            created.Id,
+            new TrainingLookupRequest
+            {
+                Code = created.Code,
+                Description = created.Description,
+                Mandatory = false,
+                MandatoryTrainingProfileIds = [],
+            },
+            TestContext.Current.CancellationToken
+        );
+
+        Assert.NotNull(updated);
+        Assert.False(updated!.Mandatory);
+        Assert.Empty(updated.MandatoryTrainingProfiles);
+    }
+
+    [Fact]
+    public async Task UpdateAsync_Should_Preserve_Mandatory_Training_Profiles_When_Ids_Are_Omitted()
+    {
+        var profile = await SeedTrainingProfileAsync("CARBINE", "Carbine Operator");
+        var created = await _strategy.CreateAsync(
+            new TrainingLookupRequest
+            {
+                Code = "MAND-PROFILE-KEEP",
+                Description = "Profile Mandatory",
+                Mandatory = true,
+                MandatoryTrainingProfileIds = [profile.Id],
+            },
+            TestContext.Current.CancellationToken
+        );
+
+        var updated = await _strategy.UpdateAsync(
+            created.Id,
+            new TrainingLookupRequest
+            {
+                Code = created.Code,
+                Description = "Updated Description",
+                Mandatory = true,
+                MandatoryTrainingProfileIds = null,
+            },
+            TestContext.Current.CancellationToken
+        );
+
+        Assert.NotNull(updated);
+        Assert.True(updated!.Mandatory);
+        Assert.Equal([profile.Id], updated.MandatoryTrainingProfiles.Select(profileType => profileType.Id));
+    }
+
+    [Fact]
+    public async Task UpdateAsync_Should_Return_Null_When_Not_Found()
+    {
+        var result = await _strategy.UpdateAsync(
+            999,
+            new TrainingLookupRequest { Code = "ABC", Description = "Test" },
+            TestContext.Current.CancellationToken
+        );
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task MoveOrderAsync_Should_Reorder_Trainings()
+    {
+        _dbContext.Trainings.AddRange(
+            new TrainingEntity
+            {
+                Code = "A",
+                Description = "Annual",
+                Order = 0,
+                EffectiveDate = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            },
+            new TrainingEntity
+            {
+                Code = "B",
+                Description = "Basic",
+                Order = 1,
+                EffectiveDate = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            },
+            new TrainingEntity
+            {
+                Code = "C",
+                Description = "Core",
+                Order = 2,
+                EffectiveDate = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            }
+        );
+
+        await _dbContext.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        var movedId = await _dbContext
+            .Trainings.Where(t => t.Code == "C")
+            .Select(t => t.Id)
+            .SingleAsync(TestContext.Current.CancellationToken);
+
+        var result = await _strategy.MoveOrderAsync(movedId, 0, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Equal("C", result.Code);
+
+        var orderedCodes = await _dbContext
+            .Trainings.OrderBy(t => t.Order)
+            .Select(t => t.Code)
+            .ToListAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(["C", "A", "B"], orderedCodes);
+    }
+
+    [Fact]
+    public async Task ExpireAsync_Should_Set_ExpiryDate()
+    {
+        var entity = new TrainingEntity
+        {
+            Code = "ACTIVE",
+            Description = "Active training",
+            Order = 0,
+            EffectiveDate = DateTimeOffset.UtcNow.AddDays(-5),
+        };
+
+        _dbContext.Trainings.Add(entity);
+        await _dbContext.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        var result = await _strategy.ExpireAsync(entity.Id, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.NotNull(result!.ExpiryDate);
+    }
+
+    [Fact]
+    public async Task UnexpireAsync_Should_Clear_ExpiryDate()
+    {
+        var entity = new TrainingEntity
+        {
+            Code = "EXPIRED",
+            Description = "Expired training",
+            Order = 0,
+            EffectiveDate = DateTimeOffset.UtcNow.AddDays(-5),
+            ExpiryDate = DateTimeOffset.UtcNow.AddDays(-1),
+        };
+
+        _dbContext.Trainings.Add(entity);
+        await _dbContext.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        var result = await _strategy.UnexpireAsync(entity.Id, TestContext.Current.CancellationToken);
+
+        Assert.NotNull(result);
+        Assert.Null(result!.ExpiryDate);
+    }
+
+    [Fact]
+    public void CodeType_Should_Match_LookupCodeType_Trainings()
+    {
+        Assert.Equal(LookupCodeTypes.Trainings, _strategy.CodeType);
+    }
+
+    private async Task<TrainingProfileType> SeedTrainingProfileAsync(string code, string _description)
+    {
+        var profile = new TrainingProfileType { Code = code };
+
+        _dbContext.TrainingProfileTypes.Add(profile);
+        await _dbContext.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        return profile;
+    }
+}

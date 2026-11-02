@@ -1,0 +1,379 @@
+<script setup lang="ts">
+import type {
+  StatCategoryResponse,
+  StatGroupResponse,
+  StatMetricResponse,
+  SubCategoryMetricResponse,
+  SubCategoryResponse,
+} from '@/api-access/generated/models';
+import UaBtn from '@/shared/components/UaBtn.vue';
+import UaCard from '@/shared/components/UaCard.vue';
+import UaFormGrid from '@/shared/components/UaFormGrid.vue';
+import UaSelect from '@/shared/components/UaSelect.vue';
+import UaTextarea from '@/shared/components/UaTextarea.vue';
+import type { SelectOption, SelectValue } from '@/types/select';
+import { mdiLockOutline } from '@mdi/js';
+import { computed, ref, watch } from 'vue';
+import type { AssignmentData } from '../types';
+import { isOvertimeMetric } from '../utils/metricHelpers';
+
+const props = defineProps<{
+  groups: StatGroupResponse[];
+  categories: StatCategoryResponse[];
+  subCategories: SubCategoryResponse[];
+  subCategoryMetrics: SubCategoryMetricResponse[];
+  metrics: StatMetricResponse[];
+  index: number;
+  errors: Record<string, string>;
+  /** When set, the group dropdown is hidden and this group is used for all category filtering. */
+  fixedGroupId?: number | null;
+  /** Override the header background colour. Falls back to --ua-card-header-bg. */
+  headerColor?: string;
+  /** When true, overtime metric inputs are disabled. */
+  overtimeLocked?: boolean;
+  /** Tooltip text shown on locked overtime inputs. */
+  overtimeLockReason?: string;
+  /** When true, all inputs are disabled and remove is hidden (e.g. signed-off entries). */
+  readonly?: boolean;
+  /** Location options for the "performed at" dropdown. */
+  locationOptions?: SelectOption[];
+  /** The user's home location ID — used to detect overrides. */
+  homeLocationId?: number | null;
+}>();
+
+const emit = defineEmits<{
+  (e: 'remove'): void;
+}>();
+
+const model = defineModel<AssignmentData>({ required: true });
+
+// ── Derived options ────────────────────────────────────────────────────────
+
+const groupOptions = computed(() =>
+  [...props.groups]
+    .sort((a, b) => (a.displayOrder ?? 0) - (b.displayOrder ?? 0))
+    .map((g) => ({ code: g.id!, description: g.name! })),
+);
+
+const effectiveGroupId = computed(() => props.fixedGroupId ?? model.value.groupId);
+
+const categoryOptions = computed(() => {
+  const filtered = props.categories
+    .filter((c) => effectiveGroupId.value === null || c.groupId === effectiveGroupId.value)
+    .sort((a, b) => (a.displayOrder ?? 0) - (b.displayOrder ?? 0))
+    .map((c) => ({ code: c.id!, description: c.name! }));
+
+  const selectedId = model.value.categoryId;
+  if (selectedId && !filtered.some((o) => o.code === selectedId)) {
+    const match = props.categories.find((c) => c.id === selectedId);
+    if (match) filtered.unshift({ code: match.id!, description: match.name! });
+  }
+
+  return filtered;
+});
+
+const subCategoryOptions = computed(() => {
+  if (!model.value.categoryId) return [];
+  const filtered = props.subCategories
+    .filter((sc) => sc.categoryId === model.value.categoryId)
+    .sort((a, b) => (a.displayOrder ?? 0) - (b.displayOrder ?? 0))
+    .map((sc) => ({ code: sc.id!, description: sc.name! }));
+
+  const selectedId = model.value.subCategoryId;
+  if (selectedId && !filtered.some((o) => o.code === selectedId)) {
+    const match = props.subCategories.find((sc) => sc.id === selectedId);
+    if (match) filtered.unshift({ code: match.id!, description: match.name! });
+  }
+
+  return filtered;
+});
+
+const showSubCategorySelect = computed(() => subCategoryOptions.value.length > 1);
+
+const metricDetails = computed(() => {
+  if (!model.value.subCategoryId) return [];
+  return props.subCategoryMetrics
+    .filter((scm) => scm.subCategoryId === model.value.subCategoryId)
+    .sort((a, b) => (a.displayOrder ?? 0) - (b.displayOrder ?? 0))
+    .map((scm) => {
+      const metric = props.metrics.find((m) => m.id === scm.metricId);
+      const isOvertime = metric ? isOvertimeMetric(metric) : false;
+      const unit = metric?.unitOfMeasure ?? '';
+      const step =
+        unit === 'count' || unit === 'count (received/concluded)'
+          ? '1'
+          : unit === '$'
+            ? '0.01'
+            : unit === 'km'
+              ? '0.1'
+              : '0.25';
+      return {
+        id: scm.id!,
+        name: metric?.name ?? '',
+        unit,
+        isOvertime,
+        isRequired: scm.isRequired ?? false,
+        step,
+        isInteger: step === '1',
+      };
+    });
+});
+
+// ── Event handlers ─────────────────────────────────────────────────────────
+
+const onGroupChange = (value: SelectValue | undefined) => {
+  const newGroupId = value !== null && value !== undefined ? Number(value) : null;
+  model.value = { ...model.value, groupId: newGroupId, categoryId: null, subCategoryId: null, metricValues: {} };
+};
+
+const onCategoryChange = (value: SelectValue | undefined) => {
+  const newCategoryId = value !== null && value !== undefined ? Number(value) : null;
+  if (!newCategoryId) {
+    model.value = { ...model.value, categoryId: null, subCategoryId: null, metricValues: {} };
+    return;
+  }
+  const subs = props.subCategories.filter((sc) => sc.categoryId === newCategoryId);
+  const autoSubId = subs.length === 1 ? (subs[0].id ?? null) : null;
+  model.value = { ...model.value, categoryId: newCategoryId, subCategoryId: autoSubId, metricValues: {} };
+};
+
+const onSubCategoryChange = (value: SelectValue | undefined) => {
+  const newId = value !== null && value !== undefined ? Number(value) : null;
+  model.value = { ...model.value, subCategoryId: newId, metricValues: {} };
+};
+
+const onMetricValueInput = (scmId: number, value: string) => {
+  model.value = {
+    ...model.value,
+    metricValues: { ...model.value.metricValues, [scmId]: value },
+  };
+};
+
+const onCommentInput = (value: string) => {
+  model.value = { ...model.value, comment: value };
+};
+
+// ── Location override ─────────────────────────────────────────────────────
+// Toggle starts ON if the assignment already has a location override from loaded data
+const showLocationOverride = ref(model.value.performedAtLocationId != null);
+
+// Keep toggle in sync if the model changes externally (e.g. on load)
+watch(
+  () => model.value.performedAtLocationId,
+  (val) => {
+    if (val != null) showLocationOverride.value = true;
+  },
+);
+
+const onTogglePerformedOutside = () => {
+  showLocationOverride.value = !showLocationOverride.value;
+  if (!showLocationOverride.value) {
+    // Turning off — clear the override
+    model.value = { ...model.value, performedAtLocationId: null };
+  }
+};
+
+const onLocationOverrideChange = (value: SelectValue | undefined) => {
+  model.value = { ...model.value, performedAtLocationId: value != null ? Number(value) : null };
+};
+</script>
+
+<template>
+  <UaCard :title="`Assignment ${index + 1}`" :header-color="headerColor" class="assignment-card">
+    <template v-if="!readonly" #header-actions>
+      <UaBtn variant="text" density="compact" color="white" class="remove-btn" @click="emit('remove')">Remove</UaBtn>
+    </template>
+    <UaFormGrid>
+      <!-- Group — hidden when a fixed group is set at the form level -->
+      <template v-if="!fixedGroupId">
+        <label class="ua-form-label" :for="`group-${model.id}`">Group</label>
+        <UaSelect
+          :id="`group-${model.id}`"
+          label="Select Group"
+          :items="groupOptions"
+          :model-value="model.groupId"
+          :error-messages="errors[`assignment_${index}_group`]"
+          :disabled="readonly"
+          @update:model-value="onGroupChange"
+        />
+      </template>
+
+      <!-- Work Area (Category) -->
+      <label class="ua-form-label" :for="`category-${model.id}`">Work Area</label>
+      <UaSelect
+        :id="`category-${model.id}`"
+        label="Select Work Area"
+        :items="categoryOptions"
+        :model-value="model.categoryId"
+        :error-messages="errors[`assignment_${index}_category`]"
+        :disabled="readonly || !effectiveGroupId"
+        @update:model-value="onCategoryChange"
+      />
+
+      <!-- Subcategory — only shown when there are multiple options -->
+      <template v-if="showSubCategorySelect">
+        <label class="ua-form-label" :for="`subcategory-${model.id}`">Subcategory</label>
+        <UaSelect
+          :id="`subcategory-${model.id}`"
+          label="Select Subcategory"
+          :items="subCategoryOptions"
+          :model-value="model.subCategoryId"
+          :error-messages="errors[`assignment_${index}_subCategory`]"
+          :disabled="readonly"
+          @update:model-value="onSubCategoryChange"
+        />
+      </template>
+
+      <!-- Dynamic metric inputs -->
+      <template v-for="m in metricDetails" :key="m.id">
+        <div class="metric-label-row">
+          <label class="ua-form-label" :for="`metric-${model.id}-${m.id}`">
+            {{ m.name }}
+            <span class="unit-label">({{ m.unit }})</span>
+            <span v-if="m.isRequired" class="required-marker">*</span>
+          </label>
+          <v-tooltip
+            v-if="m.isOvertime && overtimeLocked"
+            :text="overtimeLockReason || 'Enter 7h regular today or 35h for the week to unlock overtime.'"
+            location="top"
+          >
+            <template #activator="{ props: tooltipProps }">
+              <v-icon v-bind="tooltipProps" :icon="mdiLockOutline" size="16" class="lock-icon" />
+            </template>
+          </v-tooltip>
+        </div>
+        <v-text-field
+          :id="`metric-${model.id}-${m.id}`"
+          type="number"
+          min="0"
+          :step="m.step"
+          placeholder="0"
+          density="compact"
+          variant="outlined"
+          hide-details="auto"
+          :model-value="model.metricValues[m.id] ?? ''"
+          :error-messages="errors[`assignment_${index}_metric_${m.id}`]"
+          :disabled="readonly || (m.isOvertime && overtimeLocked)"
+          @update:model-value="(v: string) => onMetricValueInput(m.id, String(v))"
+        />
+      </template>
+
+      <!-- Assignment-level error (no metrics entered) -->
+      <template v-if="errors[`assignment_${index}`]">
+        <span />
+        <span class="field-error">{{ errors[`assignment_${index}`] }}</span>
+      </template>
+
+      <!-- Comment -->
+      <UaTextarea
+        :id="`comment-${model.id}`"
+        label="Comment"
+        rows="2"
+        auto-grow
+        placeholder="Optional note"
+        :model-value="model.comment"
+        :disabled="readonly"
+        @update:model-value="(v: string) => onCommentInput(String(v))"
+      />
+
+      <!-- Location override -->
+      <template v-if="locationOptions && locationOptions.length > 0">
+        <label class="ua-form-label">Location</label>
+        <div class="location-override">
+          <v-checkbox
+            :model-value="showLocationOverride"
+            label="Performed outside of home location?"
+            density="compact"
+            hide-details
+            color="primary"
+            :disabled="readonly"
+            @update:model-value="onTogglePerformedOutside"
+          />
+          <p v-if="showLocationOverride" class="location-hint">
+            Select the location where this work was performed. The entry will remain visible under your home location.
+          </p>
+          <UaSelect
+            v-if="showLocationOverride"
+            :id="`location-${model.id}`"
+            label="Select Location"
+            :items="locationOptions"
+            :model-value="model.performedAtLocationId"
+            :disabled="readonly"
+            @update:model-value="onLocationOverrideChange"
+          />
+        </div>
+      </template>
+    </UaFormGrid>
+  </UaCard>
+</template>
+
+<style scoped>
+.remove-btn {
+  font-size: var(--ua-font-size-sm);
+}
+
+.ua-form-label {
+  font-size: var(--ua-font-size-lg);
+  font-weight: var(--ua-font-weight-bold);
+  color: var(--ua-text-primary);
+  line-height: 1.4;
+}
+
+.unit-label {
+  font-size: var(--ua-font-size-xs);
+  font-weight: var(--ua-font-weight-normal);
+  color: var(--ua-text-muted);
+}
+
+.metric-label-row {
+  display: flex;
+  align-items: center;
+  gap: var(--ua-spacing-xs);
+}
+
+.required-marker {
+  color: rgb(var(--v-theme-error));
+  font-weight: var(--ua-font-weight-bold);
+  margin-left: 2px;
+}
+
+.lock-icon {
+  color: var(--ua-text-muted);
+  flex-shrink: 0;
+}
+
+.field-error {
+  font-size: var(--ua-font-size-sm);
+  color: rgb(var(--v-theme-error));
+}
+
+.location-override {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ua-spacing-sm);
+}
+
+.location-hint {
+  font-size: var(--ua-font-size-xs);
+  color: var(--ua-text-muted);
+  margin: 0;
+}
+
+.location-override :deep(.v-checkbox) {
+  margin: 0;
+}
+
+.location-override :deep(.v-checkbox .v-selection-control) {
+  min-height: unset;
+}
+
+.location-override :deep(.v-checkbox .v-label) {
+  font-size: var(--ua-font-size-sm);
+  color: var(--ua-text-secondary);
+}
+
+:deep(.v-field) {
+  border-radius: var(--ua-border-radius);
+  background: var(--ua-field-bg);
+}
+</style>

@@ -1,0 +1,219 @@
+import { createFetch, type UseFetchOptions } from '@vueuse/core';
+import { getActivePinia } from 'pinia';
+import { computed, unref, type MaybeRef } from 'vue';
+
+import { useAuthStore } from '@/stores/auth';
+import { redirectToLogin } from '@/utils/authNavigation';
+
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS';
+
+type QueryParamValue = string | number | boolean | null | undefined;
+type QueryParams = Record<string, QueryParamValue | QueryParamValue[]>;
+
+type RequestBody = unknown;
+type FetchErrorContext = Parameters<NonNullable<UseFetchOptions['onFetchError']>>[0];
+type AfterFetchContext = Parameters<NonNullable<UseFetchOptions['afterFetch']>>[0];
+
+let authenticationRedirectInProgress = false;
+
+export type UseFetchAPIRequest = {
+  url: string;
+  method: HttpMethod;
+  params?: MaybeRef<QueryParams>;
+  headers?: HeadersInit;
+  data?: RequestBody;
+  responseType?: 'json' | 'text' | 'blob' | 'arrayBuffer' | 'formData';
+};
+
+export type UseFetchAPIOptions = {
+  fetchOptions?: RequestInit;
+  options?: UseFetchOptions;
+};
+
+const buildQueryString = (params?: QueryParams) => {
+  if (!params) {
+    return '';
+  }
+
+  const searchParams = new URLSearchParams();
+
+  Object.entries(params).forEach(([key, value]) => {
+    // Repeated keys (?key=a&key=b), matching ASP.NET Core's default List<T> query binding.
+    const values = Array.isArray(value) ? value : [value];
+    values.forEach((v) => {
+      if (v === undefined || v === null) {
+        return;
+      }
+
+      searchParams.append(key, String(v));
+    });
+  });
+
+  const queryString = searchParams.toString();
+  return queryString ? `?${queryString}` : '';
+};
+
+const toBodyInit = (data: RequestBody, headers?: HeadersInit) => {
+  if (data === undefined || data === null) {
+    return undefined;
+  }
+
+  if (data instanceof FormData || data instanceof Blob || data instanceof URLSearchParams || typeof data === 'string') {
+    return data;
+  }
+
+  const normalizedHeaders = new Headers(headers);
+  const contentType = normalizedHeaders.get('Content-Type')?.toLowerCase();
+  if (contentType?.includes('application/json')) {
+    return JSON.stringify(data);
+  }
+
+  return JSON.stringify(data);
+};
+
+const parseResponseText = (data: unknown) => {
+  if (typeof data !== 'string') {
+    return data;
+  }
+
+  const text = data.trim();
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return data;
+  }
+};
+
+const getPayloadMessage = (payload: unknown) => {
+  if (typeof payload === 'string') {
+    return payload.trim();
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return '';
+  }
+
+  const candidate = payload as { message?: unknown; detail?: unknown; title?: unknown };
+  return [candidate.message, candidate.detail, candidate.title].find(
+    (value): value is string => typeof value === 'string' && value.trim().length > 0,
+  );
+};
+
+const buildFetchError = (payload: unknown, fallback: unknown) => {
+  const message = getPayloadMessage(payload);
+  if (message) {
+    return new Error(message);
+  }
+
+  if (fallback instanceof Error) {
+    return fallback;
+  }
+
+  return new Error(typeof fallback === 'string' && fallback ? fallback : 'Request failed.');
+};
+
+const redirectToLoginForUnauthorizedApiRequest = (requestUrl: string, status?: number) => {
+  if (status !== 401 || authenticationRedirectInProgress) {
+    return;
+  }
+
+  const requestPath = new URL(requestUrl, window.location.origin).pathname;
+  const isApiRequest = requestPath === '/api' || requestPath.startsWith('/api/');
+  const isAuthRequest = requestPath === '/api/auth' || requestPath.startsWith('/api/auth/');
+  if (!isApiRequest || isAuthRequest) {
+    return;
+  }
+
+  authenticationRedirectInProgress = true;
+
+  const pinia = getActivePinia();
+  if (pinia) {
+    useAuthStore(pinia).clearUserInfo();
+  }
+
+  redirectToLogin();
+};
+
+const buildUseFetchOptions = (requestUrl: string, options?: UseFetchOptions): UseFetchOptions => {
+  const userAfterFetch = options?.afterFetch;
+  const userOnFetchError = options?.onFetchError;
+
+  return {
+    ...options,
+    updateDataOnError: options?.updateDataOnError ?? true,
+    async afterFetch(ctx: AfterFetchContext) {
+      const nextContext = {
+        ...ctx,
+        data: parseResponseText(ctx.data),
+      };
+
+      return userAfterFetch ? userAfterFetch(nextContext) : nextContext;
+    },
+    async onFetchError(ctx: FetchErrorContext) {
+      redirectToLoginForUnauthorizedApiRequest(requestUrl, ctx.response?.status);
+
+      const isNoContentResponse = ctx.response?.status === 204 || ctx.response?.status === 205;
+      if (isNoContentResponse) {
+        return {
+          ...ctx,
+          data: undefined,
+          error: null,
+        };
+      }
+
+      const parsedData = parseResponseText(ctx.data);
+      const nextContext = {
+        ...ctx,
+        data: parsedData,
+        error: buildFetchError(parsedData, ctx.error),
+      };
+
+      return userOnFetchError ? userOnFetchError(nextContext) : nextContext;
+    },
+  };
+};
+
+const fetchAPI = createFetch({
+  baseUrl: '',
+  combination: 'overwrite',
+  options: {
+    immediate: true,
+  },
+});
+
+export const useFetchAPI = <T>(
+  { url, method, params, headers, data }: UseFetchAPIRequest,
+  { fetchOptions, options }: UseFetchAPIOptions = {},
+) => {
+  const body = toBodyInit(data, headers);
+
+  // When the body is FormData, let the browser set Content-Type automatically
+  // so it includes the required multipart boundary. Manually setting it strips the boundary.
+  const resolvedHeaders =
+    body instanceof FormData
+      ? Object.fromEntries(Object.entries(headers ?? {}).filter(([key]) => key.toLowerCase() !== 'content-type'))
+      : headers;
+
+  // Build reactive URL with query params
+  const reactiveUrl = computed(() => {
+    const queryString = buildQueryString(unref(params));
+    return `${url}${queryString}`;
+  });
+
+  const request = fetchAPI<T>(
+    reactiveUrl,
+    {
+      ...fetchOptions,
+      method,
+      headers: resolvedHeaders,
+      body: body as BodyInit,
+    },
+    buildUseFetchOptions(url, options),
+  );
+
+  return request.text() as ReturnType<typeof request.json<T>>;
+};

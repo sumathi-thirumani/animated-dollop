@@ -1,0 +1,57 @@
+name: Build and Test Web
+
+on:
+  pull_request:
+    branches:
+      - main
+
+  push:
+    branches:
+      - main
+    paths:
+      - "web/**"
+      - ".github/workflows/build-and-test-web.yml"
+      - ".github/actions/build-web/**"
+
+  workflow_dispatch:
+
+env:
+  WORKING_DIRECTORY: ./web
+
+jobs:
+  build-and-test-web:
+    name: Build and Test Web
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+
+      - name: Check for file changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d #v4.0.3
+        id: filter
+        with:
+          filters: |
+            web:
+              - 'web/**'
+              - '.github/workflows/build-and-test-web.yml'
+              - '.github/actions/build-web/**'
+
+      - name: Building Web codebase
+        if: steps.filter.outputs.web == 'true'
+        uses: ./.github/actions/build-web
+        with:
+          working_directory: ${{ env.WORKING_DIRECTORY }}
+          node_version: 22
+
+      - name: Summary
+        run: |
+          if [[ "${{ steps.filter.outputs.web }}" == "false" ]]; then
+            echo "✓ No Web changes detected - check passed"
+          else
+            echo "✓ Build and tests completed successfully"
+          fi

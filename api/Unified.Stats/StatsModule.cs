@@ -1,0 +1,79 @@
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using Unified.Authorization;
+using Unified.Common.FeatureFlags;
+using Unified.Common.Options;
+using Unified.Common.Seeding;
+using Unified.Db;
+using Unified.Stats.FeatureFlags;
+using Unified.Stats.Seeders;
+using Unified.Stats.Services;
+using Unified.Stats.Validators;
+
+namespace Unified.Stats;
+
+public static class StatsModule
+{
+    public static bool IsModuleEnabled(IConfiguration config)
+    {
+        var enabled = config.GetSection(StatsFeatureFlags.Section).Get<StatsFeatureFlags>()?.Enabled ?? false;
+        return enabled;
+    }
+
+    public static bool IsModuleEnabled(IServiceProvider serviceProvider)
+    {
+        var options = serviceProvider.GetRequiredService<IOptions<StatsFeatureFlags>>();
+        return options.Value.Enabled;
+    }
+
+    public static IServiceCollection AddStatsModule(this IServiceCollection s, IConfiguration config)
+    {
+        s.AddOptions<StatsFeatureFlags>()
+            .BindConfiguration(StatsFeatureFlags.Section)
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+        s.AddSingleton<IValidateOptions<StatsFeatureFlags>, RequiredBooleanOptionsValidator<StatsFeatureFlags>>();
+        s.AddSingleton<IFeatureFlags>(sp => sp.GetRequiredService<IOptions<StatsFeatureFlags>>().Value);
+
+        if (!IsModuleEnabled(config))
+        {
+            return s;
+        }
+
+        // Reference data services (read-only — managed via seeders)
+        s.AddScoped<IStatGroupService, StatGroupService>();
+        s.AddScoped<IStatCategoryService, StatCategoryService>();
+        s.AddScoped<ISubCategoryService, SubCategoryService>();
+        s.AddScoped<IStatMetricService, StatMetricService>();
+        s.AddScoped<ISubCategoryMetricService, SubCategoryMetricService>();
+
+        // Data entry services
+        s.AddScoped<IStatRecordService, StatRecordService>();
+        s.AddScoped<IStatSignoffService, StatSignoffService>();
+
+        // Dashboard services
+        s.AddScoped<IDashboardService, DashboardService>();
+
+        // Validators (data entry only)
+        s.AddScoped<StatRecordRequestValidator>();
+        s.AddScoped<StatSignoffRequestValidator>();
+
+        s.AddSeeder<UnifiedDbContext, StatGroupSeeder>();
+        s.AddSeeder<UnifiedDbContext, StatCategorySeeder>();
+        s.AddSeeder<UnifiedDbContext, SubCategorySeeder>();
+        s.AddSeeder<UnifiedDbContext, StatMetricSeeder>();
+        s.AddSeeder<UnifiedDbContext, SubCategoryMetricSeeder>();
+        s.AddSeeder<UnifiedDbContext, BiOracleStatMappingSeeder>();
+        s.AddSeeder<UnifiedDbContext, BiOracleLocationMappingSeeder>();
+
+        // Register permission policies owned by this module
+        s.AddAuthorizationBuilder()
+            .AddPermissionPolicy(Permissions.StatsRecordsEnterForOthers)
+            .AddPermissionPolicy(Permissions.DashboardView)
+            .AddPermissionPolicy(Permissions.DashboardSignOff)
+            .AddPermissionPolicy(Permissions.DashboardSubmit);
+
+        return s;
+    }
+}

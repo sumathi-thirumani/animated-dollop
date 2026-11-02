@@ -1,0 +1,703 @@
+using Microsoft.EntityFrameworkCore;
+using Unified.Common.Reporting;
+using Unified.Db;
+using Unified.Db.Models;
+using Unified.Db.Models.Training;
+using Unified.Db.Models.UserManagement;
+using Unified.Tests.TestHelpers;
+using Unified.Training.Services.Reporting;
+
+namespace Unified.Tests.Training.Services.Reporting;
+
+public class UserTrainingReportQueryHandlerTests : IAsyncLifetime
+{
+    private readonly string _databaseName = $"user-training-report-query-handler-{Guid.NewGuid():N}";
+    private readonly DateTimeOffset _fixedNow = new(2026, 09, 02, 12, 00, 00, TimeSpan.Zero);
+    private MutableTimeProvider _timeProvider = null!;
+    private UnifiedDbContext _db = null!;
+    private UserTrainingReportQueryHandler _handler = null!;
+
+    public async ValueTask InitializeAsync()
+    {
+        var options = new DbContextOptionsBuilder<UnifiedDbContext>()
+            .UseSqlite($"Data Source={_databaseName};Mode=Memory;Cache=Shared")
+            .Options;
+
+        _db = new SqliteTestUnifiedDbContext(options);
+        await _db.Database.OpenConnectionAsync();
+        await _db.Database.EnsureCreatedAsync();
+
+        _timeProvider = new MutableTimeProvider(_fixedNow);
+        _handler = new UserTrainingReportQueryHandler(_db, _timeProvider);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _db.Database.CloseConnectionAsync();
+        await _db.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Sort_By_UserDisplayName_Descending()
+    {
+        var training = await SeedTrainingAsync(100, "TRN", "Training", mandatory: false);
+
+        var adams = await SeedUserAsync("Bob", "Adams");
+        var brown = await SeedUserAsync("Carl", "Brown");
+        var zed = await SeedUserAsync("Amy", "Zed");
+
+        await SeedUserTrainingAsync(adams.Id, training.Id, awardedOn: _fixedNow.AddDays(-3));
+        await SeedUserTrainingAsync(brown.Id, training.Id, awardedOn: _fixedNow.AddDays(-2));
+        await SeedUserTrainingAsync(zed.Id, training.Id, awardedOn: _fixedNow.AddDays(-1));
+
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["status"] = ["active"],
+        };
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters,
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Desc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var rows = result.Rows.ToList();
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal("Zed, Amy", rows[0].UserDisplayName);
+        Assert.Equal("Brown, Carl", rows[1].UserDisplayName);
+        Assert.Equal("Adams, Bob", rows[2].UserDisplayName);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Apply_Default_Sort_When_SortBy_Is_Unknown()
+    {
+        var training = await SeedTrainingAsync(200, "TRN", "Training", mandatory: false);
+
+        var brown = await SeedUserAsync("Charlie", "Brown");
+        var adams = await SeedUserAsync("Alice", "Adams");
+
+        await SeedUserTrainingAsync(brown.Id, training.Id, awardedOn: _fixedNow.AddDays(-1));
+        await SeedUserTrainingAsync(adams.Id, training.Id, awardedOn: _fixedNow.AddDays(-2));
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters: new Dictionary<string, IReadOnlyCollection<string>>(),
+                sortBy: "notARealColumn",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var rows = result.Rows.ToList();
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal("Adams, Alice", rows[0].UserDisplayName);
+        Assert.Equal("Brown, Charlie", rows[1].UserDisplayName);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Throw_When_Status_Filter_Is_Invalid()
+    {
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["status"] = ["sideways"],
+        };
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            _handler.ExecuteAsync(
+                filters,
+                sortBy: null,
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            )
+        );
+
+        Assert.Contains("status", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Throw_When_StartDate_Is_After_EndDate()
+    {
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["startDate"] = ["2026-09-10"],
+            ["endDate"] = ["2026-09-01"],
+        };
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            _handler.ExecuteAsync(
+                filters,
+                sortBy: null,
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            )
+        );
+
+        Assert.Contains("startDate", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Include_Missing_Mandatory_And_Mark_Status_As_NotTaken()
+    {
+        var mandatory = await SeedTrainingAsync(300, "MAND", "Mandatory", mandatory: true);
+
+        var assignedUser = await SeedUserAsync("Alex", "Assigned");
+        var missingUser = await SeedUserAsync("Mia", "Missing");
+
+        await SeedUserTrainingAsync(assignedUser.Id, mandatory.Id, awardedOn: _fixedNow.AddDays(-2));
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters: new Dictionary<string, IReadOnlyCollection<string>>(),
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        Assert.Equal(2, result.TotalRows);
+
+        var missingRow = Assert.Single(result.Rows, row => row.HasMissingMandatoryTrainingAssignment);
+        Assert.Equal("Not Taken", missingRow.Status);
+        Assert.Equal("Missing, Mia", missingRow.UserDisplayName);
+
+        var activeRow = Assert.Single(result.Rows, row => !row.HasMissingMandatoryTrainingAssignment);
+        Assert.Equal("Active", activeRow.Status);
+        Assert.Equal("Assigned, Alex", activeRow.UserDisplayName);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Exclude_Disabled_Users_From_Assigned_Training_Rows()
+    {
+        var training = await SeedTrainingAsync(350, "ENABLED", "Enabled Filter", mandatory: false);
+
+        var enabledUser = await SeedUserAsync("Evan", "Enabled", isEnabled: true);
+        var disabledUser = await SeedUserAsync("Dina", "Disabled", isEnabled: false);
+
+        await SeedUserTrainingAsync(enabledUser.Id, training.Id, awardedOn: _fixedNow.AddDays(-2));
+        await SeedUserTrainingAsync(disabledUser.Id, training.Id, awardedOn: _fixedNow.AddDays(-1));
+
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["status"] = ["active"],
+        };
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters,
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var row = Assert.Single(result.Rows);
+        Assert.Equal("Enabled, Evan", row.UserDisplayName);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Exclude_Disabled_Users_From_Missing_Mandatory_Rows()
+    {
+        await SeedTrainingAsync(360, "MAND", "Mandatory", mandatory: true);
+
+        await SeedUserAsync("Ella", "Enabled", isEnabled: true);
+        await SeedUserAsync("Drew", "Disabled", isEnabled: false);
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters: new Dictionary<string, IReadOnlyCollection<string>>(),
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var row = Assert.Single(result.Rows);
+        Assert.True(row.HasMissingMandatoryTrainingAssignment);
+        Assert.Equal("Enabled, Ella", row.UserDisplayName);
+        Assert.Equal("Not Taken", row.Status);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Return_No_Rows_When_Filtered_User_Is_Disabled()
+    {
+        var training = await SeedTrainingAsync(370, "ACTIVE", "Active", mandatory: false);
+        var disabledUser = await SeedUserAsync("Dina", "Disabled", isEnabled: false);
+
+        await SeedUserTrainingAsync(disabledUser.Id, training.Id, awardedOn: _fixedNow.AddDays(-1));
+
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["userId"] = [disabledUser.Id.ToString()],
+            ["status"] = ["active"],
+        };
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters,
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        Assert.Empty(result.Rows);
+        Assert.Equal(0, result.TotalRows);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Respect_TimeProvider_When_Determining_Expiry_Status()
+    {
+        var training = await SeedTrainingAsync(380, "EXP", "Expiring", mandatory: false);
+        var user = await SeedUserAsync("Terry", "Tester");
+        var expiresAt = _fixedNow.AddMinutes(1);
+
+        await SeedUserTrainingAsync(user.Id, training.Id, awardedOn: _fixedNow.AddDays(-5), expiryDate: expiresAt);
+
+        var activeFilters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["status"] = ["active"],
+        };
+
+        var activeBeforeExpiry = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                activeFilters,
+                sortBy: null,
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var activeRow = Assert.Single(activeBeforeExpiry.Rows);
+        Assert.Equal("Active", activeRow.Status);
+
+        _timeProvider.SetUtcNow(_fixedNow.AddMinutes(2));
+
+        var activeAfterExpiry = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                activeFilters,
+                sortBy: null,
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        Assert.Empty(activeAfterExpiry.Rows);
+
+        var expiredFilters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["status"] = ["expired"],
+        };
+
+        var expiredResult = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                expiredFilters,
+                sortBy: null,
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var expiredRow = Assert.Single(expiredResult.Rows);
+        Assert.Equal("Expired", expiredRow.Status);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Filter_Status_As_NotTaken_Only()
+    {
+        var mandatory = await SeedTrainingAsync(400, "MAND2", "Mandatory 2", mandatory: true);
+
+        var assignedUser = await SeedUserAsync("Ari", "Assigned");
+        var missingUser = await SeedUserAsync("Nora", "Missing");
+
+        await SeedUserTrainingAsync(assignedUser.Id, mandatory.Id, awardedOn: _fixedNow.AddDays(-2));
+
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["status"] = ["notTaken"],
+            ["userId"] = [missingUser.Id.ToString()],
+        };
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters,
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var row = Assert.Single(result.Rows);
+        Assert.True(row.HasMissingMandatoryTrainingAssignment);
+        Assert.Equal("Not Taken", row.Status);
+        Assert.Equal("Missing, Nora", row.UserDisplayName);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Only_Include_Missing_Mandatory_For_Matching_Training_Profile()
+    {
+        var carbineProfile = await SeedTrainingProfileAsync("CARBINE", "Carbine Operator");
+        var defensiveTacticsProfile = await SeedTrainingProfileAsync("DT", "Defensive Tactics");
+
+        await SeedTrainingAsync(
+            450,
+            "CARB-MAND",
+            "Carbine Mandatory",
+            mandatory: true,
+            mandatoryTrainingProfileIds: [carbineProfile.Id]
+        );
+
+        await SeedUserAsync("Cara", "Carbine", trainingProfileId: carbineProfile.Id);
+        await SeedUserAsync("Dee", "Defensive", trainingProfileId: defensiveTacticsProfile.Id);
+        await SeedUserAsync("Una", "Unassigned");
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters: new Dictionary<string, IReadOnlyCollection<string>>(),
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var row = Assert.Single(result.Rows);
+        Assert.True(row.HasMissingMandatoryTrainingAssignment);
+        Assert.Equal("Carbine, Cara", row.UserDisplayName);
+        Assert.Equal("Not Taken", row.Status);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Apply_Global_Mandatory_To_All_Users_Even_When_Profiles_Exist()
+    {
+        await SeedTrainingAsync(460, "GLOBAL", "Global Mandatory", mandatory: true, mandatoryTrainingProfileIds: []);
+
+        var profile = await SeedTrainingProfileAsync("CARBINE", "Carbine Operator");
+        await SeedUserAsync("Pia", "Profiled", trainingProfileId: profile.Id);
+        await SeedUserAsync("Ned", "NoProfile");
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters: new Dictionary<string, IReadOnlyCollection<string>>(),
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        Assert.Equal(2, result.Rows.Count);
+        Assert.All(result.Rows, row => Assert.True(row.HasMissingMandatoryTrainingAssignment));
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Filter_By_Region_Using_User_HomeLocation_Region()
+    {
+        var training = await SeedTrainingAsync(500, "REGION", "Region Filter Training", mandatory: false);
+
+        var northRegion = await SeedRegionAsync("North");
+        var southRegion = await SeedRegionAsync("South");
+
+        var northLocation = await SeedLocationAsync("NORTH001", "North Office", "America/Vancouver", northRegion.Id);
+        var southLocation = await SeedLocationAsync("SOUTH001", "South Office", "America/Vancouver", southRegion.Id);
+
+        var northUser = await SeedUserAsync("Nia", "North", northLocation.Id);
+        var southUser = await SeedUserAsync("Sam", "South", southLocation.Id);
+        var noHomeLocationUser = await SeedUserAsync("Una", "Unknown");
+
+        await SeedUserTrainingAsync(northUser.Id, training.Id, awardedOn: DateTimeOffset.UtcNow.AddDays(-3));
+        await SeedUserTrainingAsync(southUser.Id, training.Id, awardedOn: DateTimeOffset.UtcNow.AddDays(-2));
+        await SeedUserTrainingAsync(noHomeLocationUser.Id, training.Id, awardedOn: DateTimeOffset.UtcNow.AddDays(-1));
+
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["regionId"] = [northRegion.Id.ToString()],
+            ["status"] = ["active"],
+        };
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters,
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var row = Assert.Single(result.Rows);
+        Assert.Equal("North, Nia", row.UserDisplayName);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Filter_By_Location_Using_User_HomeLocation()
+    {
+        var training = await SeedTrainingAsync(510, "LOCATION", "Location Filter Training", mandatory: false);
+
+        var region = await SeedRegionAsync("North");
+
+        var alphaLocation = await SeedLocationAsync("ALPHA001", "Alpha Office", "America/Vancouver", region.Id);
+        var betaLocation = await SeedLocationAsync("BETA001", "Beta Office", "America/Vancouver", region.Id);
+
+        var alphaUser = await SeedUserAsync("Ava", "Alpha", alphaLocation.Id);
+        var betaUser = await SeedUserAsync("Ben", "Beta", betaLocation.Id);
+        var noHomeLocationUser = await SeedUserAsync("Una", "Unknown");
+
+        await SeedUserTrainingAsync(alphaUser.Id, training.Id, awardedOn: _fixedNow.AddDays(-3));
+        await SeedUserTrainingAsync(betaUser.Id, training.Id, awardedOn: _fixedNow.AddDays(-2));
+        await SeedUserTrainingAsync(noHomeLocationUser.Id, training.Id, awardedOn: _fixedNow.AddDays(-1));
+
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["locationId"] = [alphaLocation.Id.ToString()],
+            ["status"] = ["active"],
+        };
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters,
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var row = Assert.Single(result.Rows);
+        Assert.Equal("Alpha, Ava", row.UserDisplayName);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Include_Multiple_Selected_Statuses()
+    {
+        var training = await SeedTrainingAsync(520, "STATUS_MULTI", "Status Multi", mandatory: true);
+
+        var activeUser = await SeedUserAsync("Amy", "Active");
+        var expiredUser = await SeedUserAsync("Eli", "Expired");
+        var missingUser = await SeedUserAsync("Nia", "Missing");
+
+        await SeedUserTrainingAsync(
+            activeUser.Id,
+            training.Id,
+            awardedOn: _fixedNow.AddDays(-3),
+            expiryDate: _fixedNow.AddDays(7)
+        );
+        await SeedUserTrainingAsync(
+            expiredUser.Id,
+            training.Id,
+            awardedOn: _fixedNow.AddDays(-10),
+            expiryDate: _fixedNow.AddDays(-1)
+        );
+
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["status"] = ["active", "notTaken"],
+        };
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters,
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        Assert.Equal(2, result.TotalRows);
+        Assert.Contains(result.Rows, row => row.UserDisplayName == "Active, Amy" && row.Status == "Active");
+        Assert.Contains(result.Rows, row => row.UserDisplayName == "Missing, Nia" && row.Status == "Not Taken");
+        Assert.DoesNotContain(result.Rows, row => row.UserDisplayName == "Expired, Eli");
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Filter_By_Multiple_Users_Regions_Locations_And_TrainingCodes()
+    {
+        var alphaRegion = await SeedRegionAsync("Alpha");
+        var betaRegion = await SeedRegionAsync("Beta");
+
+        var alphaLocation = await SeedLocationAsync("ALPHA", "Alpha Office", "America/Vancouver", alphaRegion.Id);
+        var betaLocation = await SeedLocationAsync("BETA", "Beta Office", "America/Vancouver", betaRegion.Id);
+
+        var alphaUser = await SeedUserAsync("Ava", "Alpha", alphaLocation.Id);
+        var betaUser = await SeedUserAsync("Ben", "Beta", betaLocation.Id);
+        var gammaUser = await SeedUserAsync("Gus", "Gamma", alphaLocation.Id);
+
+        var firstTraining = await SeedTrainingAsync(530, "CODE_A", "Code A", mandatory: false);
+        var secondTraining = await SeedTrainingAsync(531, "CODE_B", "Code B", mandatory: false);
+
+        await SeedUserTrainingAsync(alphaUser.Id, firstTraining.Id, awardedOn: _fixedNow.AddDays(-3));
+        await SeedUserTrainingAsync(betaUser.Id, secondTraining.Id, awardedOn: _fixedNow.AddDays(-2));
+        await SeedUserTrainingAsync(gammaUser.Id, firstTraining.Id, awardedOn: _fixedNow.AddDays(-1));
+
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["status"] = ["active"],
+            ["userId"] = [alphaUser.Id.ToString(), betaUser.Id.ToString()],
+            ["regionId"] = [alphaRegion.Id.ToString(), betaRegion.Id.ToString()],
+            ["locationId"] = [alphaLocation.Id.ToString(), betaLocation.Id.ToString()],
+            ["trainingCode"] = [firstTraining.Code],
+        };
+
+        var result = (UserTrainingReportResponse)
+            await _handler.ExecuteAsync(
+                filters,
+                sortBy: "userDisplayName",
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            );
+
+        var row = Assert.Single(result.Rows);
+        Assert.Equal("Alpha, Ava", row.UserDisplayName);
+        Assert.Equal("CODE_A", row.TrainingCode);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Should_Throw_When_UserId_Filter_Exceeds_Max_Values()
+    {
+        var userIds = Enumerable.Range(0, 26).Select(_ => Guid.NewGuid().ToString()).ToArray();
+        var filters = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["userId"] = userIds,
+        };
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            _handler.ExecuteAsync(
+                filters,
+                sortBy: null,
+                sortDirection: SortDirection.Asc,
+                cancellationToken: TestContext.Current.CancellationToken
+            )
+        );
+
+        Assert.Contains("userId", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("25", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<User> SeedUserAsync(
+        string firstName,
+        string lastName,
+        int? homeLocationId = null,
+        int? trainingProfileId = null,
+        bool isEnabled = true
+    )
+    {
+        var user = new User
+        {
+            Id = Guid.NewGuid(),
+            IdirName = $"{firstName}.{lastName}.{Guid.NewGuid():N}",
+            IdirId = Guid.NewGuid(),
+            IsEnabled = isEnabled,
+            FirstName = firstName,
+            LastName = lastName,
+            Gender = Gender.Other,
+            HomeLocationId = homeLocationId,
+            TrainingProfileId = trainingProfileId,
+        };
+
+        _db.Users.Add(user);
+        await _db.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        return user;
+    }
+
+    private async Task<global::Unified.Db.Models.Training.Training> SeedTrainingAsync(
+        int id,
+        string code,
+        string description,
+        bool mandatory,
+        IReadOnlyCollection<int>? mandatoryTrainingProfileIds = null
+    )
+    {
+        var category = await _db.TrainingCategories.FirstOrDefaultAsync(
+            c => c.Id == 1,
+            TestContext.Current.CancellationToken
+        );
+        if (category is null)
+        {
+            category = new TrainingCategory { Id = 1, Name = "Category" };
+            _db.TrainingCategories.Add(category);
+            await _db.SaveChangesAsync(TestContext.Current.CancellationToken);
+        }
+
+        var training = new global::Unified.Db.Models.Training.Training
+        {
+            Id = id,
+            Code = code,
+            Description = description,
+            Mandatory = mandatory,
+            Rotating = true,
+            TrainingCategoryId = category.Id,
+        };
+
+        _db.Trainings.Add(training);
+        await _db.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        if (mandatoryTrainingProfileIds is { Count: > 0 })
+        {
+            _db.TrainingProfileRequirements.AddRange(
+                mandatoryTrainingProfileIds.Select(profileId => new TrainingProfileRequirement
+                {
+                    TrainingId = training.Id,
+                    TrainingProfileTypeId = profileId,
+                })
+            );
+
+            await _db.SaveChangesAsync(TestContext.Current.CancellationToken);
+        }
+
+        return training;
+    }
+
+    private async Task<TrainingProfileType> SeedTrainingProfileAsync(string code, string _description)
+    {
+        var profile = new TrainingProfileType { Code = code, Name = code };
+
+        _db.TrainingProfileTypes.Add(profile);
+        await _db.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        return profile;
+    }
+
+    private async Task<Region> SeedRegionAsync(string name)
+    {
+        var region = new Region { Name = name };
+
+        _db.Regions.Add(region);
+        await _db.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        return region;
+    }
+
+    private async Task<Location> SeedLocationAsync(string agencyId, string name, string timezone, int? regionId)
+    {
+        var location = new Location
+        {
+            AgencyId = agencyId,
+            Name = name,
+            Timezone = timezone,
+            RegionId = regionId,
+        };
+
+        _db.Locations.Add(location);
+        await _db.SaveChangesAsync(TestContext.Current.CancellationToken);
+
+        return location;
+    }
+
+    private async Task SeedUserTrainingAsync(
+        Guid userId,
+        int trainingId,
+        DateTimeOffset awardedOn,
+        DateTimeOffset? expiryDate = null
+    )
+    {
+        _db.UserTrainings.Add(
+            new UserTraining
+            {
+                UserId = userId,
+                TrainingId = trainingId,
+                Version = 1,
+                AwardedOn = awardedOn,
+                EndingOn = awardedOn.AddHours(1),
+                ExpiryDate = expiryDate ?? awardedOn.AddDays(90),
+                NoticeState = UserTrainingNoticeStates.None,
+            }
+        );
+
+        await _db.SaveChangesAsync(TestContext.Current.CancellationToken);
+    }
+
+    private sealed class MutableTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        private DateTimeOffset _utcNow = utcNow;
+
+        public override DateTimeOffset GetUtcNow() => _utcNow;
+
+        public void SetUtcNow(DateTimeOffset utcNow) => _utcNow = utcNow;
+    }
+}

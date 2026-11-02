@@ -1,0 +1,255 @@
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Unified.Api.Services;
+using Unified.Authorization.Seeders;
+using Unified.Common.Seeding;
+using Unified.Db;
+using Unified.Reporting;
+using Unified.Stats;
+using Unified.Stats.Seeders;
+using Unified.Training;
+using Unified.Training.Seeders;
+using Unified.UserManagement;
+using Unified.UserManagement.Seeders;
+
+namespace Unified.Tests.UserManagement.Seeders;
+
+public sealed class SeedDataCompositionTests
+{
+    [Fact]
+    public void AddConfiguredSeedData_BiOracleMappingsDataSet_RegistersCompleteMappings()
+    {
+        var services = new ServiceCollection();
+        services.AddConfiguredSeedData(
+            BuildConfiguration(
+                [StatsSeedDataSets.StatsPermissionsDataSet, StatsSeedDataSets.BiOracleMappingsDataSet],
+                "Stats:Enabled"
+            ),
+            AllDataSets
+        );
+
+        using var provider = services.BuildServiceProvider();
+        var statMappings = Assert.Single(provider.GetServices<BiOracleStatMappingSeedConfiguration>());
+        var locationMappings = Assert.Single(provider.GetServices<BiOracleLocationMappingSeedConfiguration>());
+
+        Assert.Equal(516, Assert.Single(statMappings.Definitions).Mappings.Count);
+        Assert.Equal(119, locationMappings.Definitions.Count);
+    }
+
+    [Fact]
+    public void AddConfiguredSeedData_StatsDisabledWithoutBiOracleMappings_Succeeds()
+    {
+        var services = new ServiceCollection();
+        services.AddConfiguredSeedData(BuildConfiguration([]), AllDataSets);
+
+        using var provider = services.BuildServiceProvider();
+        Assert.Empty(provider.GetServices<BiOracleStatMappingSeedConfiguration>());
+    }
+
+    [Fact]
+    public void AddConfiguredSeedData_StatsDisabledWithBiOracleMappings_ThrowsConfigurationError()
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            new ServiceCollection().AddConfiguredSeedData(
+                BuildConfiguration(StatsSeedDataSets.BiOracleMappingsDataSet),
+                AllDataSets
+            )
+        );
+
+        Assert.Contains(StatsSeedDataSets.BiOracleMappingsDataSet, exception.Message);
+        Assert.Contains("unavailable", exception.Message);
+    }
+
+    [Fact]
+    public void AddConfiguredSeedData_StatsEnabledWithoutBiOracleMappings_DoesNotRequireIt()
+    {
+        var services = new ServiceCollection();
+        services.AddConfiguredSeedData(
+            BuildConfiguration([StatsSeedDataSets.StatsPermissionsDataSet], "Stats:Enabled"),
+            AllDataSets
+        );
+
+        using var provider = services.BuildServiceProvider();
+        Assert.Single(provider.GetServices<PermissionSeedConfiguration>());
+        Assert.Empty(provider.GetServices<BiOracleStatMappingSeedConfiguration>());
+    }
+
+    [Fact]
+    public void AddConfiguredSeedData_SheriffRegionLocationDataSet_RegistersRegionsAndLocations()
+    {
+        var composition = GetComposition(UserManagementSeedDataSets.SheriffRegionLocationDataSet);
+
+        Assert.Equal([UserManagementSeedDataSets.SheriffRegionLocationDataSet], composition.DataSets);
+        Assert.Equal(
+            [UserManagementSeedDataSets.SheriffRegionLocationDataSet],
+            composition.RegionConfigurations.Select(x => x.Source)
+        );
+        Assert.Equal(
+            [UserManagementSeedDataSets.SheriffRegionLocationDataSet],
+            composition.LocationConfigurations.Select(x => x.Source)
+        );
+    }
+
+    [Fact]
+    public void AddConfiguredSeedData_EmptyDataSets_DoesNotRegisterInheritedData()
+    {
+        var composition = GetComposition();
+
+        Assert.Empty(composition.DataSets);
+        Assert.Empty(composition.RegionConfigurations);
+        Assert.Empty(composition.LocationConfigurations);
+        Assert.Empty(composition.UserConfigurations);
+        Assert.Empty(composition.RoleConfigurations);
+        Assert.Empty(composition.PermissionConfigurations);
+        Assert.Empty(composition.TrainingProfileTypeConfigurations);
+    }
+
+    [Fact]
+    public void AddConfiguredSeedData_SelectedDataSets_RegistersExactlySelectedContributions()
+    {
+        var composition = GetComposition(
+            UserManagementSeedDataSets.PlatformSystemUserDataSet,
+            UserManagementSeedDataSets.DefaultRolesDataSet,
+            UserManagementSeedDataSets.UserManagementPermissionsDataSet
+        );
+
+        Assert.Equal(3, composition.DataSets.Count);
+        Assert.Equal(
+            [UserManagementSeedDataSets.PlatformSystemUserDataSet],
+            composition.UserConfigurations.Select(x => x.Source)
+        );
+        Assert.Equal(
+            [UserManagementSeedDataSets.DefaultRolesDataSet],
+            composition.RoleConfigurations.Select(x => x.Source)
+        );
+        Assert.Equal(
+            [UserManagementSeedDataSets.UserManagementPermissionsDataSet],
+            composition.PermissionConfigurations.Select(x => x.Source)
+        );
+    }
+
+    [Fact]
+    public void AddConfiguredSeedData_UnknownDataSet_ThrowsConfigurationError()
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            new ServiceCollection().AddConfiguredSeedData(BuildConfiguration("missing-data-set"), AllDataSets)
+        );
+
+        Assert.Contains("missing-data-set", exception.Message);
+        Assert.Contains("data set", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(StatsSeedDataSets.StatsPermissionsDataSet, "Stats:Enabled")]
+    [InlineData(TrainingSeedDataSets.TrainingPermissionsDataSet, "Training:Enabled")]
+    [InlineData(ReportingSeedDataSets.ReportingPermissionsDataSet, "Reporting:Enabled")]
+    public void AddConfiguredSeedData_FeatureDataSetDisabled_ThrowsConfigurationError(string dataSet, string feature)
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            new ServiceCollection().AddConfiguredSeedData(BuildConfiguration(dataSet), AllDataSets)
+        );
+
+        Assert.Contains(dataSet, exception.Message);
+        Assert.Contains(feature, exception.Message);
+    }
+
+    [Theory]
+    [InlineData(StatsSeedDataSets.StatsPermissionsDataSet, "Stats:Enabled")]
+    [InlineData(TrainingSeedDataSets.TrainingPermissionsDataSet, "Training:Enabled")]
+    [InlineData(ReportingSeedDataSets.ReportingPermissionsDataSet, "Reporting:Enabled")]
+    public void AddConfiguredSeedData_FeatureEnabledWithoutPermissionDataSet_ThrowsConfigurationError(
+        string dataSet,
+        string feature
+    )
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            new ServiceCollection().AddConfiguredSeedData(BuildConfiguration([], feature), AllDataSets)
+        );
+
+        Assert.Contains(dataSet, exception.Message);
+        Assert.Contains(feature, exception.Message);
+    }
+
+    [Theory]
+    [InlineData(StatsSeedDataSets.StatsPermissionsDataSet, "Stats:Enabled")]
+    [InlineData(TrainingSeedDataSets.TrainingPermissionsDataSet, "Training:Enabled")]
+    [InlineData(ReportingSeedDataSets.ReportingPermissionsDataSet, "Reporting:Enabled")]
+    public void AddConfiguredSeedData_FeatureDataSetEnabled_RegistersContribution(string dataSet, string feature)
+    {
+        var composition = GetComposition(dataSet, feature);
+
+        Assert.Equal([dataSet], composition.PermissionConfigurations.Select(x => x.Source));
+    }
+
+    [Fact]
+    public void AddConfiguredSeedData_TrainingProfileTypesDataSet_RegistersTrainingProfiles()
+    {
+        var composition = GetComposition(
+            [TrainingSeedDataSets.TrainingPermissionsDataSet, TrainingSeedDataSets.TrainingProfileTypesDataSet],
+            enabledFeature: "Training:Enabled"
+        );
+
+        Assert.Equal(
+            [TrainingSeedDataSets.TrainingProfileTypesDataSet],
+            composition.TrainingProfileTypeConfigurations.Select(x => x.Source)
+        );
+    }
+
+    private static SeedComposition GetComposition(params string[] dataSets) => GetComposition(dataSets, null);
+
+    private static IReadOnlyList<SeedDataSetDescriptor> AllDataSets { get; } =
+    [
+        .. UserManagementSeedDataSets.All,
+        .. StatsSeedDataSets.All,
+        .. TrainingSeedDataSets.All,
+        .. ReportingSeedDataSets.All,
+    ];
+
+    private static SeedComposition GetComposition(string dataSet, string feature) => GetComposition([dataSet], feature);
+
+    private static SeedComposition GetComposition(string[] dataSets, string? enabledFeature)
+    {
+        var services = new ServiceCollection();
+        var moduleConfiguration = BuildConfiguration([]);
+        services.AddLogging();
+        services.AddSingleton<IConfiguration>(moduleConfiguration);
+        services.AddUserManagementModule(moduleConfiguration);
+        services.AddConfiguredSeedData(BuildConfiguration(dataSets, enabledFeature), AllDataSets);
+
+        using var provider = services.BuildServiceProvider();
+        using var scope = provider.CreateScope();
+        return new SeedComposition(
+            scope.ServiceProvider.GetRequiredService<ResolvedSeedDataConfiguration>().DataSets,
+            scope.ServiceProvider.GetServices<RegionSeedConfiguration>().ToArray(),
+            scope.ServiceProvider.GetServices<LocationSeedConfiguration>().ToArray(),
+            scope.ServiceProvider.GetServices<UserSeedConfiguration>().ToArray(),
+            scope.ServiceProvider.GetServices<RoleSeedConfiguration>().ToArray(),
+            scope.ServiceProvider.GetServices<PermissionSeedConfiguration>().ToArray(),
+            scope.ServiceProvider.GetServices<TrainingProfileTypeSeedConfiguration>().ToArray()
+        );
+    }
+
+    private static IConfiguration BuildConfiguration(string dataSet) => BuildConfiguration([dataSet], null);
+
+    private static IConfiguration BuildConfiguration(string[] dataSets, string? enabledFeature = null)
+    {
+        var values = new Dictionary<string, string?>();
+        for (var index = 0; index < dataSets.Length; index++)
+            values[$"SeedData:DataSets:{index}"] = dataSets[index];
+        if (enabledFeature is not null)
+            values[$"FeatureFlags:{enabledFeature}"] = "true";
+        values["FeatureFlags:UserManagement:Enabled"] = "true";
+        values["FeatureFlags:UserManagement:UserBadgeNumber:Enabled"] = "true";
+        return new ConfigurationBuilder().AddInMemoryCollection(values).Build();
+    }
+
+    private sealed record SeedComposition(
+        IReadOnlyList<string> DataSets,
+        RegionSeedConfiguration[] RegionConfigurations,
+        LocationSeedConfiguration[] LocationConfigurations,
+        UserSeedConfiguration[] UserConfigurations,
+        RoleSeedConfiguration[] RoleConfigurations,
+        PermissionSeedConfiguration[] PermissionConfigurations,
+        TrainingProfileTypeSeedConfiguration[] TrainingProfileTypeConfigurations
+    );
+}
