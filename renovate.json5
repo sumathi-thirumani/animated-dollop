@@ -2,7 +2,7 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": "Repository-specific npm update rules for the Vue 3 and Vite frontend. Inherits shared update policies from the BC Gov preset.",
   "extends": [
-    "github>bcgov/renovate-config#2026.8.18"
+    "github>bcgov/renovate-config#2026.10.29"
   ],
   "packageRules": [
     {
