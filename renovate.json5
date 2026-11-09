@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Repository-specific npm update rules for the Vue 3 and Vite frontend. Inherits shared update policies from the BC Gov preset.",
+  "description": "Repository-specific update groups for Vue, Vite, and .NET dependencies. Inherits shared update policies from the BC Gov preset.",
   "extends": [
     "github>bcgov/renovate-config#2026.10.29"
   ],
@@ -134,6 +134,82 @@
       ],
       "groupName": "Node.js types and TypeScript configuration",
       "groupSlug": "node-types"
+    },
+    {
+      "matchManagers": [
+        "nuget"
+      ],
+      "matchDatasources": [
+        "nuget"
+      ],
+      "matchPackageNames": [
+        "Microsoft.EntityFrameworkCore",
+        "Microsoft.EntityFrameworkCore.*"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "Entity Framework Core",
+      "groupSlug": "ef-core"
+    },
+    {
+      "matchManagers": [
+        "nuget"
+      ],
+      "matchDatasources": [
+        "nuget"
+      ],
+      "matchPackageNames": [
+        "Microsoft.AspNetCore.Authentication.JwtBearer",
+        "Microsoft.AspNetCore.Authentication.OpenIdConnect",
+        "Microsoft.AspNetCore.Authorization",
+        "Microsoft.AspNetCore.OpenApi",
+        "Microsoft.AspNetCore.TestHost"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "ASP.NET Core",
+      "groupSlug": "aspnet-core"
+    },
+    {
+      "matchManagers": [
+        "nuget"
+      ],
+      "matchDatasources": [
+        "nuget"
+      ],
+      "matchPackageNames": [
+        "Microsoft.Extensions.Logging",
+        "Microsoft.Extensions.Logging.Abstractions",
+        "Microsoft.Extensions.Options.ConfigurationExtensions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "Microsoft.Extensions",
+      "groupSlug": "microsoft-extensions"
+    },
+    {
+      "matchManagers": [
+        "nuget"
+      ],
+      "matchDatasources": [
+        "nuget"
+      ],
+      "matchPackageNames": [
+        "Hangfire.Core",
+        "Hangfire.AspNetCore"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "Hangfire core",
+      "groupSlug": "hangfire-core"
     }
   ]
 }
